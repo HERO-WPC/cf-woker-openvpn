@@ -1,0 +1,19 @@
+﻿# Cloudflare Worker OpenVPN-TCP -> VLESS 订阅（线上版本 v2.11-nodes）
+#
+# v2rayN 用法：订阅分组设置 -> 添加订阅 -> 粘贴下面这行 -> 更新订阅（一次得到 9 个节点）
+# 重要：请把该节点的「Mux / 多路复用」关掉（打开当前连不通，正在修）
+
+https://test33333.wang.dpdns.org/sub
+
+# 展开后的节点链接。每个槽位会自动轮换一个当前可用的 OpenVPN 出口，
+# 所以链接本身永远不变（节点死了自动换，v2rayN 里不用改配置）。
+
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe1&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-01
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe2&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-02
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe3&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-03
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe4&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-04
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe5&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-05
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe6&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-06
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe7&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-07
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fe8&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-08
+vless://2523c510-9ff0-415b-9582-93949bfae7e3@test33333.wang.dpdns.org:443?type=ws&encryption=none&host=test33333.wang.dpdns.org&path=%2Fauto&security=tls&sni=test33333.wang.dpdns.org&fp=chrome#OGate-auto

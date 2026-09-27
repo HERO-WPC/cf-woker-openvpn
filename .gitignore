@@ -1,4 +1,4 @@
-# Local reference / debug material — not part of the deliverable
+# Local reference / debug material 閳?not part of the deliverable
 _ref/
 CF-Workers-SoftEther/
 
@@ -21,3 +21,14 @@ _worker.local.mjs
 
 # throwaway probe
 test/_probe-ip.js
+
+# local debug artifacts (binaries / snapshots / API dumps)
+local/xray/
+local/*.csv
+local/*.json
+local/live_*.js
+local/_local_lf.js
+docs/*.tmp
+
+# wrangler local cache/state
+.wrangler/

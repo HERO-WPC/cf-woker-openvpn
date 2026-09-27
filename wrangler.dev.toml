@@ -1,0 +1,7 @@
+# Local-only config for `wrangler dev` — reproduces the deployed worker on this
+# machine so the VLESS front-end can be debugged with full logs visible.
+# NOT used for deploys (deploys go through local/cfdeploy.js).
+name = "cf-ogate-local"
+main = "_worker.js"
+compatibility_date = "2026-09-27"
+workers_dev = false

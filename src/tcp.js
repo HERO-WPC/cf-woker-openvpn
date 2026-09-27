@@ -10,8 +10,9 @@
 // FIN/RST handling, an MSS option, checksum validation and IPv4-fragment
 // rejection. It is deliberately not a full RFC 793 implementation.
 import { concat, u16, u32, w16, w32, rng16, rng32, bytes } from './openvpn/bytes.js';
+import { PING_SIG } from './openvpn/client.js';
 
-export const MSS = 1200;           // conservative segment size (user-tunable)
+export const MSS = 1400;           // 1400+40 fits the tunnel's tun-mtu 1500 with margin
 const MAX_RETRIES = 5;
 const RTO_INIT = 1000;             // ms, initial retransmission timeout
 const RTO_MAX = 32000;
@@ -75,11 +76,11 @@ function parseSegment(ip) {
 const FLAG_FIN = 0x01, FLAG_SYN = 0x02, FLAG_RST = 0x04, FLAG_PSH = 0x08, FLAG_ACK = 0x10;
 
 export class TcpFlow {
-  constructor(tunnel, srcIp, dstIp, dstPort) {
-    this.tunnel = tunnel;
-    this.tunnelW = tunnel.writable.getWriter();
+  constructor(mux, srcIp, dstIp, dstPort) {
+    this.mux = mux;
+    this.tunnel = mux.tunnel;   // bookkeeping only: the flow never owns the tunnel
     this.srcIp = srcIp; this.dstIp = dstIp;
-    this.srcPort = 10000 + (rng16() % 50000);
+    this.srcPort = mux.allocPort();
     this.dstPort = dstPort;
     this.srcB = ipB(srcIp); this.dstB = ipB(dstIp);
     this.mss = MSS;
@@ -136,7 +137,7 @@ export class TcpFlow {
     pseudo[10] = (tl >> 8) & 0xFF; pseudo[11] = tl & 0xFF;
     pseudo.set(f.subarray(20, 20 + tl), 12);
     v.setUint16(36, cksum(pseudo, 0, 12 + tl));
-    this.tunnelW.write(f).catch(() => {});
+    this.mux.send(f);
     return f;
   }
 
@@ -151,8 +152,9 @@ export class TcpFlow {
   }
 
   // Feed a parsed inbound segment (returns nothing). Updates state + ACKs.
-  onSegment(pkt) {
-    const s = parseSegment(pkt);
+  // `parsed` is supplied by the multiplexer so each packet is parsed exactly once.
+  onSegment(pkt, parsed) {
+    const s = parsed || parseSegment(pkt);
     if (!s) return;
     // cumulative ACK: release every segment fully covered by the ACK
     if (s.flags & FLAG_ACK) {
@@ -275,8 +277,9 @@ export class TcpFlow {
     this._closed = true;
     try { if (this.retransTimer !== null) clearInterval(this.retransTimer); } catch { }
     try { if (this.handshakeTimer !== null) clearTimeout(this.handshakeTimer); } catch { }
-    try { this.reader && this.reader.cancel(); } catch { }
-    try { this.tunnel.close && this.tunnel.close(); } catch { }
+    // The tunnel is SHARED (cached across VLESS connections): a flow ending must
+    // only unregister itself, never tear the tunnel down.
+    try { this.mux && this.mux.removeFlow(this); } catch { }
     this.ctrl && (this.ctrl.close(), (this.ctrl = null));
   }
 }
@@ -286,8 +289,80 @@ export class TcpFlow {
 function seqLt(a, b) { return ((a - b) | 0) < 0; }
 function seqLe(a, b) { return ((a - b) | 0) <= 0; }
 
-export async function createTcp(tunnel, srcIp, dstIp, dstPort) {
-  const flow = new TcpFlow(tunnel, srcIp, dstIp, dstPort);
+// ---- tunnel multiplexer ----
+// One OpenVPN tunnel is one layer-3 interface: exactly like a real VPN client,
+// MANY TCP flows share it. Previously every VLESS connection opened its OWN
+// OpenVPN session, so the full control/TLS handshake (3-7s against a VPN Gate
+// node, sometimes 20s+ when a remote turns out to be dead) was paid per
+// connection -- that is what made v2rayN's latency test time out and show "-1".
+// The mux owns the single reader/writer on the tunnel and routes each inbound
+// IPv4 packet to the flow that owns the destination port.
+const MUXES = new WeakMap();
+
+export class TunnelMux {
+  constructor(tunnel) {
+    this.tunnel = tunnel;
+    this.flows = new Map();        // local srcPort -> TcpFlow
+    this.closed = false;
+    this.wr = tunnel.writable.getWriter();
+    this.rd = tunnel.readable.getReader();
+    // VPN Gate pushes "ping 3,ping-restart 10": a session that stays silent for
+    // 10s is restarted by the server, so an idle pooled tunnel dies within
+    // seconds. Ping every 2.5s while no flow is active to keep it up.
+    this.pingTimer = setInterval(() => {
+      if (this.closed || this.flows.size) return;
+      try { this.wr.write(new Uint8Array(PING_SIG)); } catch { }
+    }, 2500);
+    this.pump();
+  }
+  get alive() { return !this.closed; }
+  allocPort() {
+    for (let i = 0; i < 64; i++) { const p = 10000 + (rng16() % 50000); if (!this.flows.has(p)) return p; }
+    return 10000 + (rng16() % 50000);
+  }
+  addFlow(f) { this.flows.set(f.srcPort, f); }
+  removeFlow(f) { this.flows.delete(f.srcPort); }
+  send(pkt) { if (this.closed) return; try { this.wr.write(pkt).catch(() => { }); } catch { } }
+  async pump() {
+    try {
+      for (;;) {
+        const { value, done } = await this.rd.read();
+        if (done) break;
+        if (!value || !value.byteLength) continue;
+        const s = parseSegment(value);
+        if (!s) continue;                        // not an IPv4/TCP packet for us
+        const f = this.flows.get(s.dstPort);     // our local port == the flow's srcPort
+        if (f) f.onSegment(value, s);
+      }
+    } catch { }
+    // the tunnel died: fail every flow riding on it (the WS relays then close)
+    this.closed = true;
+    try { clearInterval(this.pingTimer); } catch { }
+    const fs = [...this.flows.values()];
+    this.flows.clear();
+    for (const f of fs) { try { f._shutdown(false); } catch { } }
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try { clearInterval(this.pingTimer); } catch { }
+    try { this.rd.cancel(); } catch { }
+    try { this.tunnel.close(); } catch { }
+  }
+}
+
+// One mux per tunnel; a closed tunnel always gets a fresh mux.
+export function getMux(tunnel) {
+  let m = MUXES.get(tunnel);
+  if (!m || m.closed) { m = new TunnelMux(tunnel); MUXES.set(tunnel, m); }
+  return m;
+}
+
+export async function createTcp(muxOrTunnel, srcIp, dstIp, dstPort, handshakeMs) {
+  const mux = (muxOrTunnel && typeof muxOrTunnel.allocPort === 'function') ? muxOrTunnel : getMux(muxOrTunnel);
+  if (mux.closed) { const e = new Error('TUNNEL_CLOSED'); e.code = 'TUNNEL_CLOSED'; throw e; }
+  const flow = new TcpFlow(mux, srcIp, dstIp, dstPort);
+  mux.addFlow(flow);
   const ready = flow.established();
   // --- application readable stream ---
   let ctrl = null;
@@ -295,15 +370,6 @@ export async function createTcp(tunnel, srcIp, dstIp, dstPort) {
     start: (c) => { ctrl = c; flow.ctrl = c; flow.deliver = (d) => { try { c.enqueue(d); } catch { } }; flow.onShutdown = () => { try { c.close(); } catch { } }; },
     cancel: () => { flow.fin(); },
   });
-  // --- wire tunnel reader ---
-  const rd = tunnel.readable.getReader();
-  flow.reader = rd;
-  const pump = (async () => {
-    try {
-      for (;;) { const { value, done } = await rd.read(); if (done) break; flow.onSegment(value); }
-    } catch { }
-    finally { }
-  })();
   // --- handshake: SYN ---
   flow.state = 'SYN_SENT';
   flow._emit(FLAG_SYN, new Uint8Array(0), flow.iss, 0);
@@ -314,7 +380,7 @@ export async function createTcp(tunnel, srcIp, dstIp, dstPort) {
   flow.retransTimer = setInterval(() => flow.tick(), 250);
   let handshakeReject;
   const handshakeTimeout = new Promise((_, rej) => { handshakeReject = rej; });
-  flow.handshakeTimer = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; try { handshakeReject && handshakeReject(e); } catch { } }, 15000);
+  flow.handshakeTimer = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; try { handshakeReject && handshakeReject(e); } catch { } }, handshakeMs || 15000);
   await Promise.race([ready, handshakeTimeout]).catch((e) => { flow._shutdown(true); throw e; });
   clearTimeout(flow.handshakeTimer);
   flow.handshakeTimer = null;

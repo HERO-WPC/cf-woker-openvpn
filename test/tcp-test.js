@@ -1,7 +1,7 @@
 // Unit tests for the user-space TcpFlow stack: byte-stream reassembly, out-of-order
 // reordering, duplicate suppression, retransmission, FIN and RST, and checksum
 // rejection. Builds synthetic IPv4/TCP segments and feeds them to TcpFlow.onSegment.
-import { TcpFlow, MSS } from '../src/tcp.js';
+import { TcpFlow, MSS, getMux, createTcp } from '../src/tcp.js';
 
 let fail = 0;
 const ok = (name, cond) => { if (!cond) { fail++; console.log('FAIL', name); } else console.log('ok', name); };
@@ -35,8 +35,17 @@ function makeSeg({ srcIp = '10.8.0.1', dstIp = '10.8.0.2', sport = 80, dport, se
 
 function mkFlow() {
   const out = [];
-  const tunnel = { writable: { getWriter: () => ({ write: (c) => { out.push(c); return Promise.resolve(); } }) }, readable: null, close: () => {} };
-  const flow = new TcpFlow(tunnel, '10.8.0.2', '10.8.0.1', 80);
+  // A flow no longer owns the tunnel: it talks to a multiplexer that owns the
+  // single tunnel reader/writer and routes inbound packets by local port.
+  const tunnel = { writable: null, readable: null, close: () => {} };
+  const mux = {
+    tunnel,
+    allocPort: () => 10000 + Math.floor(Math.random() * 50000),
+    send: (pkt) => { out.push(pkt); },
+    addFlow: () => {},
+    removeFlow: () => {},
+  };
+  const flow = new TcpFlow(mux, '10.8.0.2', '10.8.0.1', 80);
   return { flow, out };
 }
 
@@ -150,6 +159,51 @@ const delivered = (flow, arr) => { flow.deliver = (d) => arr.push(Buffer.from(d)
     const got = Buffer.concat(app);
     ok('overlap delivers only [1500..1800]', got.length === 300 && got[0] === payload[100]);
     ok('rcvNxt advanced to 1800', flow.rcvNxt === 1800);
+  }
+
+  // (8) multiplexer: TWO TCP flows share ONE tunnel, routed by local port.
+  // This is what removes the per-connection OpenVPN handshake (the "-1" cause).
+  {
+    const sent = [];
+    let feedCtrl = null, tunnelClosed = false;
+    const readable = new ReadableStream({ start: (c) => { feedCtrl = c; } });
+    const writable = new WritableStream({ write: (c) => { sent.push(c); } });
+    const tunnel = { readable, writable, close: () => { tunnelClosed = true; } };
+    const mux = getMux(tunnel);
+    const feed = (pkt) => feedCtrl.enqueue(pkt);
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    const rd32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+
+    const p1 = createTcp(mux, '10.8.0.2', '10.8.0.1', 80);
+    await tick();                       // WritableStream.write is dispatched async
+    const syn1 = sent[0];
+    const port1 = (syn1[20] << 8) | syn1[21], iss1 = rd32(syn1, 24);
+    const p2 = createTcp(mux, '10.8.0.2', '10.8.0.1', 443);
+    await tick();
+    const syn2 = sent[1];
+    const port2 = (syn2[20] << 8) | syn2[21], iss2 = rd32(syn2, 24);
+    ok('two flows over one tunnel get distinct local ports', port1 !== port2 && sent.length === 2);
+
+    const peer1 = 0xAABB0000 >>> 0, peer2 = 0xCCDD0000 >>> 0;
+    feed(makeSeg({ dport: port1, seq: peer1, ack: (iss1 + 1) >>> 0, flags: 0x12 }));
+    feed(makeSeg({ dport: port2, seq: peer2, ack: (iss2 + 1) >>> 0, flags: 0x12 }));
+    await tick();
+    await p1; await p2;
+    ok('both flows established through the single tunnel', mux.flows.size === 2);
+
+    const fo1 = mux.flows.get(port1), fo2 = mux.flows.get(port2);
+    const before1 = fo1.rcvNxt, before2 = fo2.rcvNxt;
+    feed(makeSeg({ dport: port2, seq: (peer2 + 1) >>> 0, ack: (iss2 + 1) >>> 0, flags: 0x18, payload: Uint8Array.from([0x41, 0x42]) }));
+    await tick();
+    ok('segment routed to the owning flow only', fo2.rcvNxt === ((before2 + 2) >>> 0) && fo1.rcvNxt === before1);
+
+    fo1._shutdown(true);
+    ok('closing one flow leaves the shared tunnel up', mux.alive && !tunnelClosed && mux.flows.size === 1);
+
+    mux.close();
+    let code = '';
+    try { await createTcp(mux, '10.8.0.2', '10.8.0.1', 80); } catch (e) { code = e.code; }
+    ok('a closed tunnel rejects new flows (TUNNEL_CLOSED)', code === 'TUNNEL_CLOSED');
   }
 
   console.log(fail ? ('\n' + fail + ' failures') : '\nALL TCP PASS');

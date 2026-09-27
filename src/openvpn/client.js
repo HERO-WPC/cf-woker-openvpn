@@ -75,7 +75,7 @@ export async function openVpnConn(cfg, transport, opts = {}) {
   for (const remote of cfg.remotes) {
     try {
       log('trying remote ' + remote.host + ':' + remote.port);
-      const tunnel = await tryRemote(remote, cfg, transport, log);
+      const tunnel = await tryRemote(remote, cfg, transport, log, opts);
       return tunnel;
     } catch (e) {
       const msg = String((e && e.message) || e);
@@ -89,7 +89,7 @@ export async function openVpnConn(cfg, transport, opts = {}) {
   throw e;
 }
 
-async function tryRemote(remote, cfg, transport, log) {
+async function tryRemote(remote, cfg, transport, log, opts) {
   const connect = transport.connect;
   const sock = connect({ hostname: remote.host, port: remote.port });
   await sock.opened;
@@ -187,7 +187,7 @@ async function tryRemote(remote, cfg, transport, log) {
   try {
     // Reset
     await ctrl.sendControl(OP.P_CONTROL_HARD_RESET_CLIENT_V2);
-    await Promise.race([ctrl.waitServerReset(), timeout(15000, 'CONTROL_TIMEOUT')]);
+    await Promise.race([ctrl.waitServerReset(), timeout((opts && opts.controlTimeout) || 15000, 'CONTROL_TIMEOUT')]);
     log('server reset received');
     await flushAck(ctrl);
     // TLS handshake
@@ -296,7 +296,7 @@ async function waitForAppData(tls, kind) {
 
 function startsWith(b, s) { const t = bytes(s); if (b.length < t.length) return false; for (let i = 0; i < t.length; i++) if (b[i] !== t[i]) return false; return true; }
 // OpenVPN data-channel keepalive signature (SoftEther ping_signature)
-const PING_SIG = [0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48];
+export const PING_SIG = [0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48];
 function isPingPacket(ip) {
   if (!ip || ip.length !== PING_SIG.length) return false;
   for (let i = 0; i < PING_SIG.length; i++) if (ip[i] !== PING_SIG[i]) return false;

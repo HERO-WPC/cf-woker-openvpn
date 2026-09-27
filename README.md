@@ -1,127 +1,83 @@
-# CF-Workers-OpenVPN-TCP
+# cf-worker-openvpn
 
-基于 Cloudflare Workers 的 **VLESS → WebSocket → OpenVPN TCP Client → OpenVPN Data Channel → 手工 IPv4/TCP → 目标** 出站代理实验项目。
+把 **VPN Gate 的公共 OpenVPN(TCP) 节点**，用**一个纯 Cloudflare Workers JS** 变成 v2rayN / mihomo 可以直接订阅的**多出口 VLESS 节点**。
 
-它不再是简单的 `WebSocket → connect() → 目标` 字节转发，也不是旧的 SSTP/PPP 路径。Worker 在受限边缘运行时内：
+一条订阅链接 → 9 个节点 → 每个节点走**不同的 OpenVPN 出口 IP**。
 
-1. 解析 `.ovpn` 配置（`remote`、`<ca>`、`<tls-auth>`、`cipher`、`auth`……）；
-2. 用 Workers `connect()` 建立到 OpenVPN 服务端的 TCP 连接；
-3. 完成 OpenVPN 控制信道：`HARD_RESET_CLIENT_V2` → TLS 1.2 握手 → `key_method 2`（密钥交换 + 用户名/密码）→ `PUSH_REQUEST` → `PUSH_REPLY`；
-4. 派生出数据信道密钥块，按 `P_DATA_V1`/`P_DATA_V2` 收发加密数据包（AES-GCM 或 AES-CBC + HMAC）；
-5. 拿到虚拟 IPv4 地址后，在 Worker 内手工构造 IPv4/TCP 包，做 `SYN / SYN+ACK / ACK / PSH` 双向中继，再通过 VLESS/WebSocket 送回客户端。
-
-> 这是协议研究与学习代码，用于验证在**没有完整系统网络栈、没有 TUN/TAP、没有原生 VPN 客户端**的 Workers 环境中，能否重建一条可用的虚拟通信路径。实际代理体验不保证稳定。
-
-## 协议路径
-
-```text
-客户端
-  VLESS over WebSocket
-    ↓
-Cloudflare Worker
-  OpenVPN TCP Client (控制信道 + 数据信道)
-    ↓
-OpenVPN / SoftEther Server (VPN Gate)
-  虚拟 IPv4 链路
-  手工 IPv4/TCP
-    ↓
-目标 TCP 服务
+```
+v2rayN ──VLESS(WS/TLS)──> CF 边缘 ──> Worker ──用户态 IPv4/TCP──> OpenVPN(TCP,纯JS) ──> VPN Gate 节点 ──> 目标
 ```
 
-## 功能特性
+## 实测
 
-- **VLESS over WebSocket** 入口（保留原项目逻辑）。
-- **`.ovpn` 解析**：`remote` / `<ca>` / `<tls-auth>` + `key-direction` / `cipher` / `data-ciphers` / `auth`；跳过证书（`<cert>/<key>`）与 TAP / UDP 不支持项。
-- **OpenVPN 控制信道**：
-  - `P_CONTROL_HARD_RESET_CLIENT_V2` / `SERVER_V2`、`P_CONTROL_V1`、`P_ACK_V1`；
-  - 可靠性通道（reliable-id、ACK、重传）；
-  - `tls-auth`（HMAC 前向/反向包，key-direction 0/1）；
-  - `key_method 2`（client/server 非对称 key_source：客户端发送 `pre_master + random1 + random2`，服务端只回 `random1 + random2`）。
-- **TLS 1.2**（纯 Web Crypto）：ECDHE / AES-GCM / SHA256，支持 `extended master secret`，证书链验证（配置 CA + 链式回退）。
-- **客户端证书认证**：解析 `<cert>/<key>` 并在服务端请求时发送 `Certificate` + `CertificateVerify`（RSA PKCS#1 v1.5 / SHA-256），支持需要客户端证书的节点（如 `opengw.net` 提供方）。
-- **数据信道**：
-  - `AES-256/128-GCM`（`P_DATA_V2`，`peer-id`）；
-  - `AES-256/128-CBC + HMAC-SHA1/256`（`P_DATA_V1`）；
-  - OpenVPN 数据密钥扩展（`OpenVPN master secret` / `OpenVPN key expansion`，TLS 1.0 PRF：MD5⊕SHA1）。
-- **虚拟 IPv4 地址**：解析 `PUSH_REPLY` 的 `ifconfig`。
-- **用户态 IPv4/TCP**：`createTcp()` 构造 IPv4/TCP 头、计算校验和、维护序号/Acknowledgement、MSS 分段，双向中继。
-- **目标地址解析**：IPv4 直用，域名走 Cloudflare DoH。
-- **诊断端点 `/ovpn-test`**：POST JSON / multipart / 原始配置，或 GET 查询参数；返回 `{ok, virtualIp, response}`。
+v2rayN 订阅后的延迟测试（同一条订阅，9 个节点）：
 
-## 服务端来源
+![v2rayN 延迟测试](docs/v2rayn-latency.png)
 
-默认用 VPN Gate 公共 Relay 列表（筑波大学志愿者项目）：
+`OGate-auto` 81ms，其余可用节点 111～190ms，9 个里 7 个可用（2 个 `-1` 见下文「已知不足」）。
 
-- VPN Gate 官网：<https://www.vpngate.net/>
-- 公共服务器列表：<https://www.vpngate.net/en/volunteer_servers.aspx?number=0>
+> 注意：这个成绩的前提是**客户端到 CF 边缘这一段路由要好**。同一套代码，从作者本机直连测是 10～20 秒，把去 Worker 的连接塞进一条日本线路后立刻变成 1.54 秒。**Worker 本身不慢，慢的是你到 CF 边缘的那条腿**（v2rayN 里给节点指定一个日本 CF 边缘 IP 收益极大）。
 
-节点质量、可用性、出口位置随列表实时变化。默认账号为 VPN Gate 公共账号 `vpn / vpn`。
+## 特性
 
-## 文件结构
+- **VLESS over WebSocket + TLS**：`cmd=1`(TCP)、`cmd=3`(mux 帧解析已实现，见不足)、early data(`sec-websocket-protocol`)、头跨 WS 帧分片自动缓冲
+- **用户态 IPv4/TCP 栈**（`src/tcp.js`）：SYN/状态机、累计 ACK、乱序缓存与去重、RTO 指数退避重传、FIN/RST、校验和验证、IPv4 分片拒绝、MSS 协商
+- **纯 JS OpenVPN TCP 客户端**（`src/openvpn/`）：可靠控制通道、TLS 握手、key_method 2、PUSH_REPLY 解析、数据通道 AES-128-CBC + SHA1 HMAC
+- **隧道多路复用**（`TunnelMux`）：一条 OpenVPN 隧道承载多条客户端 TCP 流，按本地端口分发；空闲时 2.5 秒发一次 OpenVPN ping 保活（VPN Gate 推的是 `ping 3,ping-restart 10`）
+- **出口槽位制**：`/e1`…`/e8` 每个槽位一条独立隧道、独立出口 IP；`/auto` 是自动池（轮流用最空闲的出口）
+- **节点自动轮换**：Worker 内实时拉取 VPN Gate 列表（60 个 TCP 可用节点，10 分钟缓存）、失败黑名单、拨号前用 connect RTT 预筛；槽位 key 永不变，所以**节点死了自动换、已分发的订阅链接不用改**
+- **一条订阅给全部节点**：`/sub` 返回 base64 订阅（含 8 个出口槽位 + 1 个 auto）
 
-| 文件 | 说明 |
-| --- | --- |
-| [`src/worker.js`](./src/worker.js) | Worker 入口：`import { connect } from 'cloudflare:sockets'` 并 `route()`。 |
-| [`src/handler.js`](./src/handler.js) | 路由：VLESS/WS 入口 + `/ovpn-test`；维护 `OPENVPN_OVPN` 配置。 |
-| [`src/vless.js`](./src/vless.js) | VLESS 请求头解析。 |
-| [`src/dns.js`](./src/dns.js) | Cloudflare DoH 解析。 |
-| [`src/tcp.js`](./src/tcp.js) | 用户态 IPv4/TCP（`createTcp`）。 |
-| [`src/openvpn/`](./src/openvpn) | OpenVPN 协议栈：`config` / `packet` / `control` / `crypto` / `tls` / `x509` / `data` / `client`。 |
-| [`build.js`](./build.js) | 无依赖 ESM 打包器：把 `src/` 打成单文件 `_worker.js`。 |
-| [`test/`](./test) | 单元、mock 服务端、handler、真实 VPN Gate 测试脚本。`test/configs/sample0.ovpn` 为一个示例配置。 |
-| [`LICENSE`](./LICENSE) | GPL-3.0（沿用原项目）。 |
+## 用法
 
-## 构建
+```
+# 订阅地址（v2rayN：订阅分组设置 → 添加订阅 → 粘贴 → 更新）
+https://<你的域名>/sub
 
-```bash
-node build.js        # 产出单文件 _worker.js（无依赖）
-node --check _worker.js
+# 诊断
+/version    构建版本 / UUID / 路由列表
+/nodes      实时节点表大小与年龄、黑名单、每个槽位当前绑定的节点（?refresh=1 强制刷新）
+/tunnel     当前 isolate 里活着的隧道（出口/隧道IP/流数/年龄）
+/ping       纯 connect 延迟测量：/ping?host=1.1.1.1&port=80&n=3
+/exit-test  走缓存出口跑一次 HTTP 并返回分阶段耗时（拨号/SYN/首字节）
+/ovpn-test  用给定或内嵌配置做完整 OpenVPN+HTTP 测试（返回各阶段耗时）
+/sock-test  裸 TCP 连通性测试
+/trace      进程内环形日志（前端每个阶段都记录在这里）
 ```
 
-将 `_worker.js` 部署到 Cloudflare Workers 即可(只需粘贴这一个文件)。
+部署：`node build.js` 生成 `_worker.js`，然后用你惯用的方式上传（本项目用 Cloudflare API `PUT /accounts/{acct}/workers/scripts/{name}`，见 `local/cfdeploy.js`）。
 
-> **已内置节点**:已内嵌一个 VPN Gate OpenVPN TCP 节点(`src/embedded-ovpn.js`,主节点 `219.100.37.224:443` + 备用节点,自动切换),所以**开箱即用**。
-> 想换节点,用 Worker 环境变量/`_setOpenVpnConfig()`/`.ovpn` 覆盖即可。
+## 已知不足（欢迎改进 / PR）
 
-## 测试
+1. **mux.cool 还没打通 —— 影响最大的一条。**
+   v2rayN 默认开启 mux，此时客户端发的是 `cmd=3`。已按 Xray 源码修正两处致命格式错误：
+   VLESS 的 mux 请求**不带 port/地址**（旧解析器把它当「地址类型 0」直接拒绝，这就是默认配置完全连不通的原因）；
+   以及 `End`/`KeepAlive` 帧**没有 dataLen 字段**（多写 2 字节会让客户端帧读取器错位）。
+   **但端到端仍然是 000**，说明还有一处帧/会话细节没对上。缺的是一个能从**同一个 isolate** 抓到客户端首帧字节的工具（CF 会把请求打散到不同 isolate，`/trace` 常常抓不到）。
+   → 打通后一条长连接能让隧道永不冷掉，是最有价值的改动。**当前请在 v2rayN 里关闭 mux。**
+2. **每条新连接可能都要重做一次 OpenVPN 握手（1.1～3.5 秒）。** CF 在请求结束时回收 outbound socket，状态又是 per-isolate 的，所以隧道很难跨请求热起来（实测连续请求会落到不同 isolate）。这决定了「冷」时的延迟下限。
+3. **VPN Gate 的 `ping-restart 10`。** 服务端 10 秒收不到数据就重启会话；isolate 一空闲，保活 `setInterval` 就不再被调度 → 隧道必死。已用「超过 7 秒没碰过就判定已死、立即重拨」减轻（否则会白等超时再重拨，正好越过 v2rayN 的 5 秒测试超时）。
+4. **没有 UDP/QUIC。** CF Workers 的 `connect()` 只有 TCP，所以 UDP 流量不支持。
+5. **纯 JS 加解密**（无 AES-NI）+ 每请求 CPU 时间限制 → 吞吐受限，大文件慢。
+6. **用户态 TCP 不完整**：无窗口缩放（65535 上限）、无 SACK、无真正的拥塞控制（固定 RTO 1000ms 起、250ms tick）。
+7. **节点池质量**：VPN Gate 现在全网 TCP 可用节点 JP=42 / KR=37，**美国只有 1 个且握手失败**；志愿者节点上下线频繁。
+8. **没有跨 isolate 的共享状态**（未接 KV）：实时节点表和热隧道都只在单个 isolate 内有效，这会让第 2、3 条的症状更明显。接 KV 是明确可做的下一步。
 
-```bash
-node test/run.js     # unit + mock(GCM/CBC) + handler
+## 目录
+
+```
+src/worker.js          入口（把 execution context 传下去，用于 waitUntil 保活）
+src/handler.js         路由 + VLESS 前端状态机 + mux.cool + 出口槽位/轮换 + 诊断端点
+src/vless.js           VLESS 头解析（cmd=1/3）
+src/tcp.js             用户态 IPv4/TCP + 隧道多路复用器
+src/openvpn/           OpenVPN TCP 客户端（控制通道/TLS/key_method2/数据通道/加密）
+src/nodes.js           实时 VPN Gate 节点源 + 黑名单 + connect RTT 预筛
+src/embedded-ovpn.js   内嵌引导配置（引导用，运行时会用实时列表轮换）
+build.js               极简 ESM 打包器 → _worker.js
+test/                  单元与集成测试（node test/run.js）
+local/                 作者的调试/测量脚本（bench-nodes / pick-exits / us-probe / xray-from-sub 等）
 ```
 
-- `test/unit.js`：MD5/HMAC/AES/keyExpansion 等原语。
-- `test/mocktest.js AES-128-GCM|AES-128-CBC`：本地 mock OpenVPN 服务端，完整 TLS + 数据信道 + HTTP 回环。
-- `test/handler-test.js`：`/ovpn-test` 端到端。
-- `test/vpngate.js <file.ovpn> <ip> <port>`：连接真实 VPN Gate 节点（默认走 `127.0.0.1:10808` 代理，`OVPN_PROXY=0` 可关闭）。
-- `test/nodecheck.js <host> <port> [--debug]`：对任意节点做「连接 + 出口 IP」诊断。
-- `test/egress.js`：连真实节点并请求 `api.ipify.org` 验证出口 IP。
+## 许可
 
-## 已验证
-
-在真实 VPN Gate OpenVPN TCP 节点上（含 SoftEther Academic 集群 `public-vpn-*.opengw.net` 的 `219.100.37.x:443` 与 opengw.net 需客户端证书的节点）：
-
-- HARD_RESET / TLS 1.2（`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`）握手成功；
-- `key_method 2`（`vpn/vpn` 认证）通过；
-- 服务端要求客户端证书时，自动发送 `<cert>/<key>` 并完成 `CertificateVerify`；
-- `PUSH_REPLY` 获得虚拟 IPv4（`10.2xx.x.x`）；
-- 数据信道解密成功（AES-128-CBC），识别并忽略 OpenVPN keepalive ping；
-- 用户态 TCP 建立 `SYN/SYN+ACK`，经隧道发出 HTTP 请求；
-- 出口 IP 确认为对应节点地址（如美国节点 `73.131.220.236`、日本节点 `219.100.37.x`）。
-
-## 已知限制
-
-- 当前服务端若强制 **AES-256-GCM-SHA384** 控制信道记录保护，与本实现存在互操作边界（已回退到 AES-128-GCM 优先套件）；多数 VPN Gate 节点可用。
-- **只支持 TCP**：OpenVPN over TCP；UDP 不在当前主线内，也只转发 TCP 目标。
-- 客户端证书仅支持 RSA 私钥（PKCS#1 / PKCS#8）；ECDSA 客户端证书暂未实现。
-- `tls-auth` 支持 `key-direction 0/1`；无 `key-direction` 时按双向 `keys[0]` 处理。
-- 证书链验证采用「配置 CA → 链式回退」，宁可拒绝不可信链也不接受伪造。
-- 长连接、大流量受 Workers 限制影响。
-- 认证、参数和路径需按实际服务端调整。
-
-## 参考
-
-- 开源协议：[GPL-3.0](./LICENSE)（衍生自 ToiCF/CF-Workers-SoftEther，协议沿用）。
-- 原项目：<https://github.com/ToiCF/CF-Workers-SoftEther>
-- SoftEther VPN：<https://www.softether.org/> · GitHub <https://github.com/SoftEtherVPN/SoftEtherVPN>
-- OpenVPN 文档 / 源码（本地 `_ref/` 为参考材料，未纳入本仓库）。
-- VPN Gate：<https://www.vpngate.net/>
+MIT。OpenVPN 配置与节点来自 [VPN Gate](https://www.vpngate.net/)（筑波大学学术实验项目），本项目只调用其公开 API 与公开节点列表，不修改也不代理其服务；使用时请遵守 VPN Gate 条款与所在地法律。
