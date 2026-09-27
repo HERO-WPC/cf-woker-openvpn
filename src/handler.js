@@ -93,6 +93,7 @@ async function ovpnTest(req, transport) {
   let tunnel, tcp;
   try { tunnel = await openVpnConn(cfg, transport); }
   catch (e) { return json({ ok: false, stage: 'openvpn', remotes: cfg.remotes, error: String(e.message || e) }, 502); }
+  if (!tunnel.virtualIp) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'openvpn', error: 'NO_VIRTUAL_IP: server connected but did not push an ifconfig', remotes: cfg.remotes }, 502); }
   try { tcp = await createTcp(tunnel, tunnel.virtualIp, target, port); }
   catch (e) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'tcp', error: String(e.message || e) }, 502); }
   const wr = tcp.writable.getWriter(), rd = tcp.readable.getReader();

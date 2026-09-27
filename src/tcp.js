@@ -6,7 +6,10 @@ import { concat, u16, u32, rng16, rng32 } from './openvpn/bytes.js';
 
 const MSS = 1400;
 
-function ipB(ip) { return new Uint8Array(ip.split('.').map(Number)); }
+function ipB(ip) {
+  if (typeof ip !== 'string' || !/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) { const e = new Error('INVALID_IP ' + String(ip)); e.code = 'INVALID_IP'; throw e; }
+  return new Uint8Array(ip.split('.').map(Number));
+}
 function cksum(d, o, n) { let s = 0; for (let i = o; i < o + n - 1; i += 2) s += u16(d, i); if (n & 1) s += d[o + n - 1] << 8; while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return (~s) & 0xFFFF; }
 
 export async function createTcp(tunnel, srcIp, dstIp, dstPort) {

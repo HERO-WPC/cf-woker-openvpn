@@ -1812,7 +1812,10 @@ const { concat, u16, u32, rng16, rng32 } = __ns["m3"];
 
 const MSS = 1400;
 
-function ipB(ip) { return new Uint8Array(ip.split('.').map(Number)); }
+function ipB(ip) {
+  if (typeof ip !== 'string' || !/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) { const e = new Error('INVALID_IP ' + String(ip)); e.code = 'INVALID_IP'; throw e; }
+  return new Uint8Array(ip.split('.').map(Number));
+}
 function cksum(d, o, n) { let s = 0; for (let i = o; i < o + n - 1; i += 2) s += u16(d, i); if (n & 1) s += d[o + n - 1] << 8; while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return (~s) & 0xFFFF; }
 
 async function createTcp(tunnel, srcIp, dstIp, dstPort) {
@@ -2015,6 +2018,7 @@ async function ovpnTest(req, transport) {
   let tunnel, tcp;
   try { tunnel = await openVpnConn(cfg, transport); }
   catch (e) { return json({ ok: false, stage: 'openvpn', remotes: cfg.remotes, error: String(e.message || e) }, 502); }
+  if (!tunnel.virtualIp) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'openvpn', error: 'NO_VIRTUAL_IP: server connected but did not push an ifconfig', remotes: cfg.remotes }, 502); }
   try { tcp = await createTcp(tunnel, tunnel.virtualIp, target, port); }
   catch (e) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'tcp', error: String(e.message || e) }, 502); }
   const wr = tcp.writable.getWriter(), rd = tcp.readable.getReader();
