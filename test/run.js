@@ -6,6 +6,8 @@ import { root } from './root.js';
 const T = root();
 const steps = [
   { name: 'unit', cmd: ['node', 'test/unit.js'] },
+  { name: 'tcp stack', cmd: ['node', 'test/tcp-test.js'] },
+  { name: 'tls trust/EKU', cmd: ['node', 'test/tls-test.js'] },
   { name: 'mock GCM', cmd: ['node', 'test/mocktest.js', 'AES-128-GCM'] },
   { name: 'mock CBC', cmd: ['node', 'test/mocktest.js', 'AES-128-CBC'] },
   { name: 'handler /ovpn-test', cmd: ['node', 'test/handler-test.js'] },

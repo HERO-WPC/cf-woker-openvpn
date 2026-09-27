@@ -36,6 +36,7 @@ export class TlsClient {
     this.log = opts.log || (() => {});
     this.log2 = opts.log2 || null;
     this.forceNoEms = !!opts.forceNoEms;
+    this.remoteCertTls = !!opts.remoteCertTls;
     this.buf = new Uint8Array(0);
     this.handshakeBytes = new Uint8Array(0); // accumulated handshake messages
     this.state = 'idle';
@@ -312,19 +313,18 @@ export class TlsClient {
     const trusted = [this.caDer].filter(Boolean);
     const chain = this.serverChain.map(parseX509);
     let verified = false;
-    // 1) verify against the configured CA
+    // 1) leaf directly signed by the configured CA
     for (const t of trusted) {
       try {
         const caCert = parseX509(t);
         if (await verifySignature(caCert.publicKey.spkiDer, leaf.signatureAlgorithm, leaf.signature, leaf.tbs)) { verified = true; break; }
       } catch { }
     }
-    // 2) fallback: verify the presented chain is internally consistent and rooted
-    //    at a self-signed cert (handles configs whose <ca> is stale). Every
-    //    signature is still verified, so a forged chain is never accepted.
-    if (!verified && chain.length >= 2) {
-      // walk the presented chain: every cert signed by the next, then the last
-      // cert must be signed by a configured CA (or be self-signed).
+    // 2) leaf -> ... -> intermediate chain whose LAST cert is signed by the
+    //    configured CA. Every presented signature is verified, and ONLY the
+    //    configured CA may act as the trust anchor — a self-signed root that the
+    //    server hands us is NEVER trusted (that would defeat the trust model).
+    if (!verified && chain.length >= 2 && trusted.length) {
       let good = true;
       for (let j = 0; j + 1 < chain.length; j++) {
         const ok = await verifySignature(chain[j + 1].publicKey.spkiDer, chain[j].signatureAlgorithm, chain[j].signature, chain[j].tbs);
@@ -332,15 +332,16 @@ export class TlsClient {
       }
       if (good) {
         const last = chain[chain.length - 1];
-        let okCA = false;
         for (const t of trusted) {
-          try { const ca = parseX509(t); if (await verifySignature(ca.publicKey.spkiDer, last.signatureAlgorithm, last.signature, last.tbs)) { okCA = true; break; } } catch { }
+          try { const ca = parseX509(t); if (await verifySignature(ca.publicKey.spkiDer, last.signatureAlgorithm, last.signature, last.tbs)) { verified = true; break; } } catch { }
         }
-        const selfSigned = await verifySignature(last.publicKey.spkiDer, last.signatureAlgorithm, last.signature, last.tbs);
-        if (okCA || selfSigned) verified = true;
       }
     }
-    if (!verified) { const e = new Error('CERT_VERIFY_FAILED'); e.code = 'CERT_VERIFY_FAILED'; throw e; }
+    if (!verified) { const e = new Error('OPENVPN_TLS_CA_VERIFY_FAILED: certificate chain does not trust the configured CA'); e.code = 'OPENVPN_TLS_CA_VERIFY_FAILED'; throw e; }
+    // remote-cert-tls server: the leaf must be permitted for TLS server auth.
+    if (this.remoteCertTls && !leaf.ext.serverAuth) {
+      const e = new Error('OPENVPN_TLS_EKU_INVALID: leaf certificate lacks TLS serverAuth EKU'); e.code = 'OPENVPN_TLS_EKU_INVALID'; throw e;
+    }
   }
 
   async _serverKeyExchange(msg) {

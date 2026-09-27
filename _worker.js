@@ -43,14 +43,16 @@ class ByteQueue {
 
 // Stream buffer that reassembles the 2-byte-length-prefixed OpenVPN-TCP packets.
 // Each call to push(chunk) returns an array of complete packet Uint8Arrays.
+// Handles partial + coalesced frames; rejects malformed over-length prefixes.
 class TcpPacketStream {
-  constructor(maxLen = 65535) { this.q = new ByteQueue(); this.maxLen = maxLen; }
+  constructor(maxLen = 65535, hardCap = 262144) { this.q = new ByteQueue(); this.maxLen = maxLen; this.hardCap = hardCap; }
   push(chunk) {
     this.q.append(chunk);
     const out = [];
     while (this.q.length >= 2) {
+      if (this.q.length > this.hardCap) { const e = new Error('OPENVPN_TCP_FRAME_OVERFLOW'); e.code = 'OPENVPN_TCP_FRAME_OVERFLOW'; this.q.buf = new Uint8Array(0); throw e; }
       const plen = u16(this.q.buf, 0); // 2-byte big-endian length prefix
-      if (plen < 1 || plen > this.maxLen) { this.q.buf = new Uint8Array(0); break; } // protocol error
+      if (plen < 1 || plen > this.maxLen) { const e = new Error('OPENVPN_TCP_FRAME_INVALID len=' + plen); e.code = 'OPENVPN_TCP_FRAME_INVALID'; this.q.buf = new Uint8Array(0); throw e; }
       if (this.q.length >= 2 + plen) {
         this.q.skip(2);
         out.push(this.q.read(plen));
@@ -95,10 +97,20 @@ return { concat, u16, u32, u24, w16, w24, w32, hex, utf8, bytes, rng, rng16, rng
 __ns["m3"] = m3;
 const m2 = (() => {
 const { u16 } = __ns["m3"];
-// VLESS request header parsing (preserved from the original project, unchanged).
+// VLESS request header parsing (preserved from the original project).
 
 
 const idB = null; // uuid bytes are injected by the worker to keep this module pure
+
+// Strict UUID string -> 16 raw bytes. A VLESS UUID is a standard UUID whose
+// 32 hex chars (after stripping '-') encode 16 bytes — two hex chars per byte.
+function uuidToBytes(uuid) {
+  const h = String(uuid).replace(/-/g, '');
+  if (!/^[0-9a-fA-F]{32}$/.test(h)) { const e = new Error('INVALID_UUID ' + uuid); e.code = 'INVALID_UUID'; throw e; }
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
 
 function vless(c, uuidBytes) {
   if (c.length < 23) return null;
@@ -125,7 +137,7 @@ const addr = (t, b) => t === 3
   : t === 1
     ? `${b[0]}.${b[1]}.${b[2]}.${b[3]}`
     : `[${Array.from({ length: 8 }, (_, i) => u16(b, i * 2).toString(16)).join(':')}]`;
-return { addr, vless };
+return { addr, uuidToBytes, vless };
 })();
 __ns["m2"] = m2;
 const m4 = (() => {
@@ -526,9 +538,11 @@ class ReliableChannel {
       return;
     }
     if (parsed.opcode === OP.P_CONTROL_V1 || parsed.opcode === OP.P_CONTROL_SOFT_RESET_V1) {
+      // Always ACK (including duplicates) so the peer stops retransmitting; only
+      // deliver a packet when its reliable-id is strictly newer than what we saw.
+      this._ack(parsed.reliableId);
       if (parsed.reliableId > this.lastSeenRel) {
         this.lastSeenRel = parsed.reliableId;
-        this._ack(parsed.reliableId);
         this.queue.push(parsed);
         if (this.waiter) { const w = this.waiter; this.waiter = null; w(this.queue.shift()); }
       }
@@ -693,14 +707,20 @@ function parseX509(der) {
   s.signatureAlgorithm = signatureAlgorithm;
   s.signature = signature;
   s.ext = { serverAuth: false, clientAuth: false, ca: false, keyUsage: 0 };
-  // extensions
-  const extsNode = tbsChildren[9];
+  // extensions: the tbsCertificate v3 [3] context-specific field may appear at
+  // different child indices depending on whether issuerUniqueID/subjectUniqueID
+  // are present, so scan for the 0xA3 tag instead of assuming index 9.
+  let extsNode = null;
+  for (const ch of tbsChildren) if (ch.tag === 0xA3) { extsNode = ch; break; }
   if (extsNode) {
-    for (const extSeq of extsNode.children) {
+    // wrap = A3{ SEQUENCE{ ...extensions... } }
+    const root = (extsNode.children && extsNode.children[0] && extsNode.children[0].tag === 0x30) ? extsNode.children[0] : extsNode;
+    for (const extSeq of (root.children || [])) {
       const ext = extSeq.children;
       const oid = oidName(ext[0].value);
       const critical = ext[1] && ext[1].tag === 0x01;
       const valNode = critical ? ext[2] : ext[1];
+      if (!valNode) continue;
       if (oid === 'extendedKeyUsage') {
         const ev = derParse(valNode.value);
         if (ev.tag === 0x30) for (const o of ev.children) {
@@ -827,6 +847,7 @@ class TlsClient {
     this.log = opts.log || (() => {});
     this.log2 = opts.log2 || null;
     this.forceNoEms = !!opts.forceNoEms;
+    this.remoteCertTls = !!opts.remoteCertTls;
     this.buf = new Uint8Array(0);
     this.handshakeBytes = new Uint8Array(0); // accumulated handshake messages
     this.state = 'idle';
@@ -1103,19 +1124,18 @@ class TlsClient {
     const trusted = [this.caDer].filter(Boolean);
     const chain = this.serverChain.map(parseX509);
     let verified = false;
-    // 1) verify against the configured CA
+    // 1) leaf directly signed by the configured CA
     for (const t of trusted) {
       try {
         const caCert = parseX509(t);
         if (await verifySignature(caCert.publicKey.spkiDer, leaf.signatureAlgorithm, leaf.signature, leaf.tbs)) { verified = true; break; }
       } catch { }
     }
-    // 2) fallback: verify the presented chain is internally consistent and rooted
-    //    at a self-signed cert (handles configs whose <ca> is stale). Every
-    //    signature is still verified, so a forged chain is never accepted.
-    if (!verified && chain.length >= 2) {
-      // walk the presented chain: every cert signed by the next, then the last
-      // cert must be signed by a configured CA (or be self-signed).
+    // 2) leaf -> ... -> intermediate chain whose LAST cert is signed by the
+    //    configured CA. Every presented signature is verified, and ONLY the
+    //    configured CA may act as the trust anchor — a self-signed root that the
+    //    server hands us is NEVER trusted (that would defeat the trust model).
+    if (!verified && chain.length >= 2 && trusted.length) {
       let good = true;
       for (let j = 0; j + 1 < chain.length; j++) {
         const ok = await verifySignature(chain[j + 1].publicKey.spkiDer, chain[j].signatureAlgorithm, chain[j].signature, chain[j].tbs);
@@ -1123,15 +1143,16 @@ class TlsClient {
       }
       if (good) {
         const last = chain[chain.length - 1];
-        let okCA = false;
         for (const t of trusted) {
-          try { const ca = parseX509(t); if (await verifySignature(ca.publicKey.spkiDer, last.signatureAlgorithm, last.signature, last.tbs)) { okCA = true; break; } } catch { }
+          try { const ca = parseX509(t); if (await verifySignature(ca.publicKey.spkiDer, last.signatureAlgorithm, last.signature, last.tbs)) { verified = true; break; } } catch { }
         }
-        const selfSigned = await verifySignature(last.publicKey.spkiDer, last.signatureAlgorithm, last.signature, last.tbs);
-        if (okCA || selfSigned) verified = true;
       }
     }
-    if (!verified) { const e = new Error('CERT_VERIFY_FAILED'); e.code = 'CERT_VERIFY_FAILED'; throw e; }
+    if (!verified) { const e = new Error('OPENVPN_TLS_CA_VERIFY_FAILED: certificate chain does not trust the configured CA'); e.code = 'OPENVPN_TLS_CA_VERIFY_FAILED'; throw e; }
+    // remote-cert-tls server: the leaf must be permitted for TLS server auth.
+    if (this.remoteCertTls && !leaf.ext.serverAuth) {
+      const e = new Error('OPENVPN_TLS_EKU_INVALID: leaf certificate lacks TLS serverAuth EKU'); e.code = 'OPENVPN_TLS_EKU_INVALID'; throw e;
+    }
   }
 
   async _serverKeyExchange(msg) {
@@ -1607,6 +1628,7 @@ async function tryRemote(remote, cfg, transport, log) {
     onSend: (rec) => tlsOut.push(rec),
     verifyCaPem: cfg.ca, sni: /^[0-9.]+$/.test(remote.host) ? null : remote.host,
     clientCertPem: cfg.cert, clientKeyPem: cfg.key,
+    remoteCertTls: cfg.remoteCertTls,
     log, log2: log,
   });
 
@@ -1815,107 +1837,333 @@ return { openVpnConn, parseOvpn };
 })();
 __ns["m5"] = m5;
 const m13 = (() => {
-const { concat, u16, u32, rng16, rng32 } = __ns["m3"];
+const { concat, u16, u32, w16, w32, rng16, rng32, bytes } = __ns["m3"];
 // User-space IPv4/TCP stack that rides on top of an OpenVPN tunnel.
-// The tunnel exposes { readable (raw IPv4 packets), writable (raw IPv4 packets),
-// virtualIp, close }. createTcp() does the TCP handshake and bidirectional relay,
-// returning { readable, writable, close } for the application (VLESS) side.
+// A single TcpFlow is a TCP connection in the user-space stack: it exchanges
+// IPv4/TCP segments with the peer through the tunnel's raw IPv4 channel and
+// exposes { readable, writable, close } to the application (VLESS). It is
+// structured as its own object so the whole flow can later be multiplexed.
+//
+// Scope: TCP over IPv4, one flow per connection (v1 of the proxy). Includes a
+// bounded state machine, a cumulative-acknowledgement send queue with RTO /
+// exponential-backoff retransmission, a receive-side out-of-order buffer,
+// FIN/RST handling, an MSS option, checksum validation and IPv4-fragment
+// rejection. It is deliberately not a full RFC 793 implementation.
 
 
-const MSS = 1400;
+const MSS = 1200;           // conservative segment size (user-tunable)
+const MAX_RETRIES = 5;
+const RTO_INIT = 1000;             // ms, initial retransmission timeout
+const RTO_MAX = 32000;
+const WINDOW = 65535;
 
 function ipB(ip) {
   if (typeof ip !== 'string' || !/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) { const e = new Error('INVALID_IP ' + String(ip)); e.code = 'INVALID_IP'; throw e; }
   return new Uint8Array(ip.split('.').map(Number));
 }
-function cksum(d, o, n) { let s = 0; for (let i = o; i < o + n - 1; i += 2) s += u16(d, i); if (n & 1) s += d[o + n - 1] << 8; while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return (~s) & 0xFFFF; }
+function foldSum(d, o, n) { let s = 0; for (let i = o; i < o + n - 1; i += 2) s += u16(d, i); if (n & 1) s += d[o + n - 1] << 8; while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return s & 0xFFFF; }
+const cksum = (d, o, n) => (~foldSum(d, o, n)) & 0xFFFF;
+const cksumOk = (d, o, n) => foldSum(d, o, n) === 0xFFFF; // sum incl stored cksum == 0xFFFF
 
-async function createTcp(tunnel, srcIp, dstIp, dstPort) {
-  const tunnelW = tunnel.writable.getWriter();
-  const srcPort = 10000 + (rng16() % 50000);
-  const srcB = ipB(srcIp), dstB = ipB(dstIp);
-  let seq = rng32(), ack = 0;
-  const ipTpl = new Uint8Array(20);
-  ipTpl.set([0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6]);
-  ipTpl.set(srcB, 12); ipTpl.set(dstB, 16);
-  const pseudo = new Uint8Array(1432);
-  pseudo.set(srcB); pseudo.set(dstB, 4); pseudo[9] = 6;
-
-  const frame = (flags, data = new Uint8Array(0)) => {
-    const pl = data.length, tl = 20 + pl, il = 20 + tl, f = new Uint8Array(il), v = new DataView(f.buffer);
-    f.set(ipTpl, 0);
-    v.setUint16(2, il); v.setUint16(4, rng16()); v.setUint16(10, cksum(f, 0, 20));
-    v.setUint16(20, srcPort); v.setUint16(22, dstPort); v.setUint32(24, seq); v.setUint32(28, ack);
-    f[32] = 0x50; f[33] = flags; v.setUint16(34, 65535);
-    if (pl) f.set(data, 40);
-    pseudo[10] = tl >> 8; pseudo[11] = tl & 0xFF; pseudo.set(f.subarray(20, 20 + tl), 12);
-    v.setUint16(36, cksum(pseudo, 0, 12 + tl));
-    return f;
+// ---- segment parsing (receive side) ----
+// Parse an IPv4 packet as TCP. Returns null if not a well-formed, non-fragmented
+// TCP segment (fragmented IPv4 packets are deliberately not reassembled).
+function parseSegment(ip) {
+  if (ip.length < 40 || ip[9] !== 6) return null;
+  const ihl = (ip[0] & 0x0F) * 4;
+  if (ihl < 20 || ihl > 60 || ip.length < ihl + 20) return null;
+  // IPv4 fragmentation: MF flag or non-zero fragment offset -> reject (drop)
+  if ((ip[6] & 0x20) || ((ip[6] & 0x1F) << 8 | ip[7]) !== 0) return null;
+  const totalLen = u16(ip, 2);
+  if (totalLen < ihl + 20 || totalLen > ip.length) return null;
+  // validate IPv4 header checksum
+  if (!cksumOk(ip, 0, ihl)) return null;
+  const tcp = ihl;
+  const off = (ip[tcp + 12] >> 4) * 4;
+  if (off < 20 || off > 60 || tcp + off > totalLen) return null;
+  const doff = off;
+  const payload = ip.subarray(tcp + doff, totalLen);
+  // validate TCP checksum (pseudo-header); the 2-byte length field is the TCP
+  // segment length (totalLen - tcp), not the pseudo-header length
+  const tl = totalLen - tcp;
+  const pseudo = new Uint8Array(12 + tl);
+  pseudo.set(ip.subarray(12, 16), 0); pseudo.set(ip.subarray(16, 20), 4); pseudo[9] = 6;
+  pseudo[10] = (tl >> 8) & 0xFF; pseudo[11] = tl & 0xFF;
+  pseudo.set(ip.subarray(tcp, totalLen), 12);
+  if (!cksumOk(pseudo, 0, 12 + tl)) return null;
+  // parse options (ignore unknown kinds; never crash)
+  let mss = null, optOff = tcp + 20;
+  while (optOff < tcp + doff) {
+    const kind = ip[optOff];
+    if (kind === 0) break;                     // EOL
+    if (kind === 1) { optOff += 1; continue; } // NOP
+    if (optOff + 2 > tcp + doff) break;
+    const len = ip[optOff + 1];
+    if (len < 2 || optOff + len > tcp + doff) break;
+    if (kind === 2 && len === 4) mss = u16(ip, optOff + 2);
+    optOff += len;
+  }
+  return {
+    srcPort: u16(ip, tcp), dstPort: u16(ip, tcp + 2),
+    seq: u32(ip, tcp + 4), ack: u32(ip, tcp + 8),
+    flags: ip[tcp + 13], window: u16(ip, tcp + 14), mss, payload,
   };
-
-  const match = (ip) => {
-    if (ip.length < 40 || ip[9] !== 6) return null;
-    const ihl = (ip[0] & 0xF) * 4;
-    if (u16(ip, ihl) !== dstPort || u16(ip, ihl + 2) !== srcPort) return null;
-    return { flags: ip[ihl + 13], seq: u32(ip, ihl + 4), off: ihl + ((ip[ihl + 12] >> 4) & 0xF) * 4, tcp: ihl };
-  };
-
-  let reader = null;
-  const close = () => { try { reader?.cancel(); } catch { } try { tunnel.close?.(); } catch { } };
-
-  const handshake = async () => {
-    await tunnelW.write(frame(0x02)); seq++;
-    const r = tunnel.readable.getReader(); reader = r;
-    for (let i = 0; i < 40; i++) {
-      const { value, done } = await r.read();
-      if (done) throw new Error('TARGET_TCP_FAILED');
-      const m = match(value);
-      if (!m) continue;
-      if ((m.flags & 0x12) === 0x12) { ack = (m.seq + 1) >>> 0; await tunnelW.write(frame(0x10)); return; }
-    }
-    throw new Error('TARGET_TCP_FAILED');
-  };
-
-  const acceptData = async (ctrl) => {
-    try {
-      let pend = [], pLen = 0;
-      const flush = () => { if (!pLen) return; ctrl.enqueue(pend.length === 1 ? pend[0] : concat(...pend)); pend = []; pLen = 0; tunnelW.write(frame(0x10)).catch(() => { }); };
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const m = match(value);
-        if (!m) continue;
-        if (m.off < value.length) {
-          const d = value.subarray(m.off);
-          if (d.length) { ack = (m.seq + d.length) >>> 0; pend.push(new Uint8Array(d)); pLen += d.length; }
-        }
-        if (m.flags & 0x01) { flush(); ack = (ack + 1) >>> 0; tunnelW.write(frame(0x11)).catch(() => { }); ctrl.close(); return; }
-        if (pLen >= 32768) flush();
-      }
-      ctrl.close();
-    } catch { try { ctrl.close(); } catch { } }
-  };
-
-  const run = async () => {
-    await handshake();
-    let ctrl = null;
-    const readable = new ReadableStream({ start: c => { ctrl = c; }, cancel: () => tunnelW.write(frame(0x11)).catch(() => { }) });
-    acceptData(ctrl);
-    const writable = new WritableStream({
-      async write(chunk) {
-        const d = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-        if (d.length <= MSS) { await tunnelW.write(frame(0x18, d)); seq = (seq + d.length) >>> 0; return; }
-        for (let o = 0; o < d.length; o += MSS) { const seg = d.subarray(o, Math.min(o + MSS, d.length)); await tunnelW.write(frame(0x18, seg)); seq = (seq + seg.length) >>> 0; }
-      },
-      close: () => tunnelW.write(frame(0x11)).catch(() => { }),
-      abort: close,
-    });
-    return { readable, writable, close };
-  };
-  return run();
 }
 
-return { createTcp };
+const FLAG_FIN = 0x01, FLAG_SYN = 0x02, FLAG_RST = 0x04, FLAG_PSH = 0x08, FLAG_ACK = 0x10;
+
+class TcpFlow {
+  constructor(tunnel, srcIp, dstIp, dstPort) {
+    this.tunnel = tunnel;
+    this.tunnelW = tunnel.writable.getWriter();
+    this.srcIp = srcIp; this.dstIp = dstIp;
+    this.srcPort = 10000 + (rng16() % 50000);
+    this.dstPort = dstPort;
+    this.srcB = ipB(srcIp); this.dstB = ipB(dstIp);
+    this.mss = MSS;
+    // send side
+    this.iss = rng32(); this.sndUna = this.iss; this.sndNxt = this.iss;
+    this.unacked = [];            // { seq, endSeq, payload, flags, sentAt, retries }
+    // receive side
+    this.rcvNxt = 0; this.rcvWnd = WINDOW;
+    this.outOfOrder = [];         // { seq, endSeq, payload, flags }
+    this.pendingFin = -1;
+    // state / lifecycle
+    this.state = 'CLOSED';
+    this.rto = RTO_INIT;
+    this.reader = null;
+    this.timer = null;
+    this.ctrl = null;             // readable controller
+    this.appClosed = false;
+    this.deliver = () => {};      // app data callback
+    this.onShutdown = () => {};   // app EOF / close callback
+    this.establishedResolve = null;
+    this._est = new Promise((r) => { this.establishedResolve = r; });
+    this.peerClosed = false;
+    this._closed = false;
+  }
+  established() { return this._est; }
+
+  _emit(flags, payload, seq, ack) {
+    const opts = (flags & FLAG_SYN) ? bytes([2, 4, this.mss >> 8, this.mss & 0xFF]) : null; // MSS option on SYN
+    const tcpHdrLen = 20 + (opts ? opts.length : 0);
+    const tl = tcpHdrLen + payload.length;
+    const il = 20 + tl;
+    const f = new Uint8Array(il);
+    const v = new DataView(f.buffer);
+    // IPv4
+    f[0] = 0x45;
+    v.setUint16(2, il);
+    v.setUint16(4, rng16());
+    v.setUint16(6, 0);
+    f[8] = 64; f[9] = 6;
+    f.set(this.srcB, 12); f.set(this.dstB, 16);
+    v.setUint16(10, cksum(f, 0, 20));
+    // TCP
+    v.setUint16(20, this.srcPort); v.setUint16(22, this.dstPort);
+    v.setUint32(24, seq >>> 0); v.setUint32(28, ack >>> 0);
+    f[32] = ((tcpHdrLen >> 2) << 4); // TCP data offset in the high nibble
+    f[33] = flags;
+    v.setUint16(34, this.rcvWnd);
+    if (opts) f.set(opts, 40);
+    if (payload.length) f.set(payload, 20 + tcpHdrLen);
+    // pseudo header
+    const pseudo = new Uint8Array(12 + tl);
+    pseudo.set(this.srcB, 0); pseudo.set(this.dstB, 4); pseudo[9] = 6;
+    pseudo[10] = (tl >> 8) & 0xFF; pseudo[11] = tl & 0xFF;
+    pseudo.set(f.subarray(20, 20 + tl), 12);
+    v.setUint16(36, cksum(pseudo, 0, 12 + tl));
+    this.tunnelW.write(f).catch(() => {});
+    return f;
+  }
+
+  _track(seq, endSeq, payload, flags) {
+    this.unacked.push({ seq: seq >>> 0, endSeq: endSeq >>> 0, payload, flags, sentAt: Date.now(), retries: 0 });
+  }
+  _deliver(seg, partialOff) {
+    // segment bytes from partialOff..(len) are newly contiguous
+    const d = seg.payload.subarray(partialOff);
+    if (d.length) this.deliver(d);
+    this.rcvNxt = (this.rcvNxt + (seg.payload.length - partialOff)) >>> 0;
+  }
+
+  // Feed a parsed inbound segment (returns nothing). Updates state + ACKs.
+  onSegment(pkt) {
+    const s = parseSegment(pkt);
+    if (!s) return;
+    // cumulative ACK: release every segment fully covered by the ACK
+    if (s.flags & FLAG_ACK) {
+      const ack = s.ack;
+      if (seqLt(this.sndUna, ack)) {
+        this.sndUna = ack;
+        this.unacked = this.unacked.filter((seg) => !seqLe(seg.endSeq, ack));
+        if (!this.unacked.length) this.rto = RTO_INIT;
+      }
+      if (this.state === 'SYN_SENT' && ack === (this.iss + 1) >>> 0) {
+        this.state = 'ESTABLISHED';
+        this.rcvNxt = (s.seq + 1) >>> 0; // the peer's SYN consumes one seq slot
+        this.establishedResolve();
+        this._sendAck();
+      }
+    }
+    // RST terminates the flow immediately
+    if (s.flags & FLAG_RST) { this._shutdown(true); return; }
+    // receive-side data (+ SYN / FIN slots)
+    const len = s.payload.length;
+    if (len || (s.flags & FLAG_SYN) || (s.flags & FLAG_FIN)) {
+      this._receive({ seq: s.seq, endSeq: (s.seq + len) >>> 0, payload: s.payload, flags: s.flags });
+      if (s.flags & FLAG_FIN) {
+        const finPos = (s.seq + len) >>> 0;
+        if (seqLe(finPos, this.rcvNxt)) { this.rcvNxt = (finPos + 1) >>> 0; this._peerFin(); }
+      }
+    }
+    this._sendAck();
+  }
+
+  _receive(seg) {
+    const segEnd = seg.endSeq;
+    if (process.env.TCPDBG) console.log('[recv] seq=' + seg.seq + ' end=' + segEnd + ' rcvNxt=' + this.rcvNxt + ' len=' + seg.payload.length + ' dup=' + seqLe(segEnd, this.rcvNxt));
+    // fully duplicate (already fully delivered)
+    if (seqLe(segEnd, this.rcvNxt)) return;
+    // exactly contiguous at rcvNxt
+    if (seg.seq === this.rcvNxt) {
+      this._deliver(seg, 0);
+      this._drain();
+      return;
+    }
+    // overlaps rcvNxt from the left (rcvNxt inside this segment)
+    if (seqLt(seg.seq, this.rcvNxt) && seqLt(this.rcvNxt, segEnd)) {
+      this._deliver(seg, (this.rcvNxt - seg.seq) >>> 0);
+      this._drain();
+      return;
+    }
+    // ahead of rcvNxt -> buffer
+    if (seqLt(this.rcvNxt, seg.seq)) {
+      if (process.env.TCPDBG) console.log('[recv] buffering seq=' + seg.seq + ' (lt=' + seqLt(this.rcvNxt, seg.seq) + ')');
+      this.outOfOrder.push(seg);
+      this.outOfOrder.sort((a, b) => a.seq - b.seq);
+    }
+  }
+  _drain() {
+    for (;;) {
+      const i = this.outOfOrder.findIndex((x) => x.seq === this.rcvNxt);
+      if (i < 0) break;
+      const seg = this.outOfOrder[i];
+      this.outOfOrder.splice(i, 1);
+      if (process.env.TCPDBG) console.log('[drain] delivering buffered seq=' + seg.seq + ' len=' + seg.payload.length);
+      this._deliver(seg, 0);
+    }
+  }
+  _peerFin() {
+    this.peerClosed = true;
+    if (this.state === 'ESTABLISHED' || this.state === 'SYN_SENT') this.state = 'CLOSE_WAIT';
+    else if (this.state === 'FIN_WAIT_1') { this.state = 'CLOSE_WAIT'; }
+    this._sendAck();
+    this.onShutdown(); // EOF to the app read side
+  }
+
+  _sendAck() {
+    if (this.state === 'CLOSED') return;
+    this._emit(FLAG_ACK, new Uint8Array(0), this.sndNxt, this.rcvNxt);
+  }
+
+  // ---- application sending ----
+  write(data) {
+    const d = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (this._closed) return Promise.resolve();
+    for (let o = 0; o < d.length; o += this.mss) {
+      const seg = d.subarray(o, Math.min(o + this.mss, d.length));
+      const seq = this.sndNxt;
+      this._emit(FLAG_PSH | FLAG_ACK, seg, seq, this.rcvNxt);
+      this._track(seq, (seq + seg.length) >>> 0, seg, FLAG_PSH | FLAG_ACK);
+      this.sndNxt = (this.sndNxt + seg.length) >>> 0;
+    }
+    return Promise.resolve();
+  }
+  fin() {
+    if (this._closed || (this.state !== 'ESTABLISHED' && this.state !== 'CLOSE_WAIT' && this.state !== 'FIN_WAIT_2')) return;
+    const seq = this.sndNxt;
+    this._emit(FLAG_FIN | FLAG_ACK, new Uint8Array(0), seq, this.rcvNxt);
+    this._track(seq, (seq + 1) >>> 0, new Uint8Array(0), FLAG_FIN | FLAG_ACK);
+    this.sndNxt = (this.sndNxt + 1) >>> 0;
+    if (this.state === 'ESTABLISHED') this.state = 'FIN_WAIT_1';
+    else if (this.state === 'CLOSE_WAIT') this.state = 'LAST_ACK';
+  }
+
+  // Periodic retransmission / RTO:: called by a timer.
+  tick() {
+    if (this._closed) return;
+    const now = Date.now();
+    const overdue = this.unacked.filter((seg) => now - seg.sentAt >= this.rto);
+    if (!overdue.length) return;
+    for (const seg of overdue) {
+      seg.retries++;
+      if (seg.retries > MAX_RETRIES) { this._shutdown(true); return; }
+      seg.sentAt = now;
+      this._emit(seg.flags, seg.payload, seg.seq, this.rcvNxt);
+    }
+    this.rto = Math.min(RTO_MAX, this.rto * 2);
+    if (this.state === 'SYN_SENT' && this.unacked.length) { /* keep waiting */ }
+  }
+  get hasUnacked() { return this.unacked.length > 0; }
+
+  _shutdown(reset) {
+    if (this._closed) return;
+    this._closed = true;
+    try { clearInterval(this.timer); } catch { }
+    try { this.reader && this.reader.cancel(); } catch { }
+    try { this.tunnel.close && this.tunnel.close(); } catch { }
+    this.ctrl && (this.ctrl.close(), (this.ctrl = null));
+  }
+}
+
+// 32-bit sequence comparison helpers (RFC 793 style): a is "before" b when the
+// signed 32-bit difference (a - b) is negative.
+function seqLt(a, b) { return ((a - b) | 0) < 0; }
+function seqLe(a, b) { return ((a - b) | 0) <= 0; }
+
+async function createTcp(tunnel, srcIp, dstIp, dstPort) {
+  const flow = new TcpFlow(tunnel, srcIp, dstIp, dstPort);
+  const ready = flow.established();
+  // --- application readable stream ---
+  let ctrl = null;
+  const readable = new ReadableStream({
+    start: (c) => { ctrl = c; flow.ctrl = c; flow.deliver = (d) => { try { c.enqueue(d); } catch { } }; flow.onShutdown = () => { try { c.close(); } catch { } }; },
+    cancel: () => { flow.fin(); },
+  });
+  // --- wire tunnel reader ---
+  const rd = tunnel.readable.getReader();
+  flow.reader = rd;
+  const pump = (async () => {
+    try {
+      for (;;) { const { value, done } = await rd.read(); if (done) break; flow.onSegment(value); }
+    } catch { }
+    finally { }
+  })();
+  // --- handshake: SYN ---
+  flow.state = 'SYN_SENT';
+  flow._emit(FLAG_SYN, new Uint8Array(0), flow.iss, 0);
+  flow._track(flow.iss, (flow.iss + 1) >>> 0, new Uint8Array(0), FLAG_SYN);
+  flow.sndNxt = (flow.iss + 1) >>> 0;
+  // --- retransmission timer ---
+  const timer = setInterval(() => flow.tick(), 250);
+  flow.timer = timer;
+  const handshake = await Promise.race([
+    ready,
+    new Promise((_, rej) => { flow.timer.handshakeLimit = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; rej(e); }, 15000); }),
+  ]).catch((e) => { flow._shutdown(true); throw e; });
+  clearTimeout(flow.timer.handshakeLimit);
+
+  // --- application writable stream ---
+  const writable = new WritableStream({
+    write: (chunk) => flow.write(chunk),
+    close: () => { flow.fin(); },
+    abort: () => flow._shutdown(true),
+  });
+  return { readable, writable, close: () => flow._shutdown(true) };
+}
+
+return { MSS, TcpFlow, createTcp };
 })();
 __ns["m13"] = m13;
 const m14 = (() => {
@@ -1934,7 +2182,7 @@ const { parseOvpn } = __ns["m12"];
 const { createTcp } = __ns["m13"];
 const { openVpnConn } = __ns["m5"];
 const { resolveIP } = __ns["m4"];
-const { vless, addr } = __ns["m2"];
+const { vless, addr, uuidToBytes } = __ns["m2"];
 // Worker request routing: VLESS-over-WebSocket tunnel entry (unchanged from the
 // original project) + an /ovpn-test diagnostic endpoint. Pure Workers JS.
 
@@ -1960,7 +2208,7 @@ refreshConfig();
 function _setOpenVpnConfig(text) { OPENVPN_OVPN = text || ''; refreshConfig(); }
 
 const UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
-const idBytes = Uint8Array.from(UUID.replaceAll('-', ''), (c) => parseInt(c, 16));
+const idBytes = uuidToBytes(UUID); // strict 16-byte; throws if invalid
 const enc = (s) => new TextEncoder().encode(s);
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
 const timeoutSec = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));

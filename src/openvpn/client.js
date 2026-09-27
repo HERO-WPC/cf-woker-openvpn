@@ -118,6 +118,7 @@ async function tryRemote(remote, cfg, transport, log) {
     onSend: (rec) => tlsOut.push(rec),
     verifyCaPem: cfg.ca, sni: /^[0-9.]+$/.test(remote.host) ? null : remote.host,
     clientCertPem: cfg.cert, clientKeyPem: cfg.key,
+    remoteCertTls: cfg.remoteCertTls,
     log, log2: log,
   });
 

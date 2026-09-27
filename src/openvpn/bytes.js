@@ -37,14 +37,16 @@ export class ByteQueue {
 
 // Stream buffer that reassembles the 2-byte-length-prefixed OpenVPN-TCP packets.
 // Each call to push(chunk) returns an array of complete packet Uint8Arrays.
+// Handles partial + coalesced frames; rejects malformed over-length prefixes.
 export class TcpPacketStream {
-  constructor(maxLen = 65535) { this.q = new ByteQueue(); this.maxLen = maxLen; }
+  constructor(maxLen = 65535, hardCap = 262144) { this.q = new ByteQueue(); this.maxLen = maxLen; this.hardCap = hardCap; }
   push(chunk) {
     this.q.append(chunk);
     const out = [];
     while (this.q.length >= 2) {
+      if (this.q.length > this.hardCap) { const e = new Error('OPENVPN_TCP_FRAME_OVERFLOW'); e.code = 'OPENVPN_TCP_FRAME_OVERFLOW'; this.q.buf = new Uint8Array(0); throw e; }
       const plen = u16(this.q.buf, 0); // 2-byte big-endian length prefix
-      if (plen < 1 || plen > this.maxLen) { this.q.buf = new Uint8Array(0); break; } // protocol error
+      if (plen < 1 || plen > this.maxLen) { const e = new Error('OPENVPN_TCP_FRAME_INVALID len=' + plen); e.code = 'OPENVPN_TCP_FRAME_INVALID'; this.q.buf = new Uint8Array(0); throw e; }
       if (this.q.length >= 2 + plen) {
         this.q.skip(2);
         out.push(this.q.read(plen));

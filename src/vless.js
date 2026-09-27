@@ -1,7 +1,17 @@
-// VLESS request header parsing (preserved from the original project, unchanged).
+// VLESS request header parsing (preserved from the original project).
 import { u16 } from './openvpn/bytes.js';
 
 const idB = null; // uuid bytes are injected by the worker to keep this module pure
+
+// Strict UUID string -> 16 raw bytes. A VLESS UUID is a standard UUID whose
+// 32 hex chars (after stripping '-') encode 16 bytes — two hex chars per byte.
+export function uuidToBytes(uuid) {
+  const h = String(uuid).replace(/-/g, '');
+  if (!/^[0-9a-fA-F]{32}$/.test(h)) { const e = new Error('INVALID_UUID ' + uuid); e.code = 'INVALID_UUID'; throw e; }
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
 
 export function vless(c, uuidBytes) {
   if (c.length < 23) return null;

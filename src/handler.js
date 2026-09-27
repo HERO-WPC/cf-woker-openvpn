@@ -1,6 +1,6 @@
 // Worker request routing: VLESS-over-WebSocket tunnel entry (unchanged from the
 // original project) + an /ovpn-test diagnostic endpoint. Pure Workers JS.
-import { vless, addr } from './vless.js';
+import { vless, addr, uuidToBytes } from './vless.js';
 import { resolveIP } from './dns.js';
 import { openVpnConn } from './openvpn/client.js';
 import { createTcp } from './tcp.js';
@@ -23,7 +23,7 @@ refreshConfig();
 export function _setOpenVpnConfig(text) { OPENVPN_OVPN = text || ''; refreshConfig(); }
 
 const UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
-const idBytes = Uint8Array.from(UUID.replaceAll('-', ''), (c) => parseInt(c, 16));
+const idBytes = uuidToBytes(UUID); // strict 16-byte; throws if invalid
 const enc = (s) => new TextEncoder().encode(s);
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
 const timeoutSec = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));

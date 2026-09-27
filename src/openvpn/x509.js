@@ -131,14 +131,20 @@ export function parseX509(der) {
   s.signatureAlgorithm = signatureAlgorithm;
   s.signature = signature;
   s.ext = { serverAuth: false, clientAuth: false, ca: false, keyUsage: 0 };
-  // extensions
-  const extsNode = tbsChildren[9];
+  // extensions: the tbsCertificate v3 [3] context-specific field may appear at
+  // different child indices depending on whether issuerUniqueID/subjectUniqueID
+  // are present, so scan for the 0xA3 tag instead of assuming index 9.
+  let extsNode = null;
+  for (const ch of tbsChildren) if (ch.tag === 0xA3) { extsNode = ch; break; }
   if (extsNode) {
-    for (const extSeq of extsNode.children) {
+    // wrap = A3{ SEQUENCE{ ...extensions... } }
+    const root = (extsNode.children && extsNode.children[0] && extsNode.children[0].tag === 0x30) ? extsNode.children[0] : extsNode;
+    for (const extSeq of (root.children || [])) {
       const ext = extSeq.children;
       const oid = oidName(ext[0].value);
       const critical = ext[1] && ext[1].tag === 0x01;
       const valNode = critical ? ext[2] : ext[1];
+      if (!valNode) continue;
       if (oid === 'extendedKeyUsage') {
         const ev = derParse(valNode.value);
         if (ev.tag === 0x30) for (const o of ev.children) {

@@ -1,6 +1,7 @@
 // Generates a self-signed RSA certificate (DER writer + WebCrypto) for the
 // mock OpenVPN server. The client test config uses this cert as its <ca>.
-export async function makeSelfSigned() {
+// opts: { serverAuth:boolean (default true), clientAuth:boolean (default true) }
+export async function makeSelfSigned(opts = {}) {
   const kp = await crypto.subtle.generateKey(
     { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
     true, ['sign', 'verify']);
@@ -39,7 +40,10 @@ export async function makeSelfSigned() {
 
   const extBasic = seq(oid('2.5.29.19'), octet(seq(boolTrue())));
   const extKu = seq(oid('2.5.29.15'), octet(bitString([0x05, 0, 0])));
-  const extEku = seq(oid('2.5.29.37'), octet(seq(oid('1.3.6.1.5.5.7.3.1'), oid('1.3.6.1.5.5.7.3.2'))));
+  const ekus = [];
+  if (opts.serverAuth !== false) ekus.push(oid('1.3.6.1.5.5.7.3.1'));
+  if (opts.clientAuth !== false) ekus.push(oid('1.3.6.1.5.5.7.3.2'));
+  const extEku = seq(oid('2.5.29.37'), octet(seq(...ekus)));
   const extensions = seq(extBasic, extKu, extEku);
 
   const tbs = seq(

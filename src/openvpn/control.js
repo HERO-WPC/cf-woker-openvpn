@@ -68,9 +68,11 @@ export class ReliableChannel {
       return;
     }
     if (parsed.opcode === OP.P_CONTROL_V1 || parsed.opcode === OP.P_CONTROL_SOFT_RESET_V1) {
+      // Always ACK (including duplicates) so the peer stops retransmitting; only
+      // deliver a packet when its reliable-id is strictly newer than what we saw.
+      this._ack(parsed.reliableId);
       if (parsed.reliableId > this.lastSeenRel) {
         this.lastSeenRel = parsed.reliableId;
-        this._ack(parsed.reliableId);
         this.queue.push(parsed);
         if (this.waiter) { const w = this.waiter; this.waiter = null; w(this.queue.shift()); }
       }

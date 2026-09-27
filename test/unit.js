@@ -2,7 +2,8 @@
 import { parseOvpn } from '../src/openvpn/config.js';
 import { md5, hmacMd5, openvpnPRF, keyExpansion, aesGcmEncrypt, aesGcmDecrypt } from '../src/openvpn/crypto.js';
 import { readFileSync } from 'fs';
-import { hex, concat, bytes, u32 } from '../src/openvpn/bytes.js';
+import { hex, concat, bytes, u32, TcpPacketStream } from '../src/openvpn/bytes.js';
+import { uuidToBytes } from '../src/vless.js';
 import { root } from './root.js';
 
 let fail = 0;
@@ -46,6 +47,35 @@ catch (e) { fail++; console.log('FAIL parseOvpn', e.message); }
   const b2 = await keyExpansion(ks, c, s);
   eq('keyExpansion deterministic', hex(b1), hex(b2));
   eq('keyExpansion length', b1.length, 256);
+
+  // ---- UUID -> 16 bytes (strict) ----
+  const UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
+  hexeq('uuidToBytes correct', uuidToBytes(UUID), '2523c5109ff0415b958293949bfae7e3');
+  hexeq('uuidToBytes accepts uppercase', uuidToBytes('2523C510-9FF0-415B-9582-93949BFAE7E3'), '2523c5109ff0415b958293949bfae7e3');
+  hexeq('uuidToBytes strips multiple dashes', uuidToBytes('2523c5109ff0415b958293949bfae7e3'), '2523c5109ff0415b958293949bfae7e3');
+  let uuidErr = '';
+  try { uuidToBytes('not-a-uuid'); } catch (e) { uuidErr = e.code || e.message; }
+  eq('uuidToBytes invalid -> INVALID_UUID', uuidErr, 'INVALID_UUID');
+  let uuidErr2 = '';
+  try { uuidToBytes('2523c5109ff0415b958293949bfae7e'); } catch (e) { uuidErr2 = e.code || e.message; } // 31 hex chars
+  eq('uuidToBytes 31 hex chars -> INVALID_UUID', uuidErr2, 'INVALID_UUID');
+
+  // ---- OpenVPN TCP framing (TcpPacketStream) ----
+  // helper: build a length-prefixed packet
+  const frame = (pkt) => { const f = new Uint8Array(2 + pkt.length); f[0] = pkt.length >> 8; f[1] = pkt.length & 0xFF; f.set(pkt, 2); return f; };
+  const stream = new TcpPacketStream();
+  // packet A split into 3 reads
+  let r1 = stream.push(frame(bytes('AAA')).subarray(0, 2));
+  eq('framing: partial read1 empty', r1.length, 0);
+  r1 = stream.push(concat(bytes('AAA'), frame(bytes('BBB'))));
+  eq('framing: coalesced read yields two packets', r1.length, 2);
+  eq('framing: packet A', String.fromCharCode(...bytes(r1[0])), 'AAA');
+  eq('framing: packet B', String.fromCharCode(...bytes(r1[1])), 'BBB');
+  // invalid length -> throws labeled error
+  const frameStream = new TcpPacketStream();
+  let frameErr = '';
+  try { frameStream.push(new Uint8Array([0, 0])); } catch (e) { frameErr = e.code; }
+  eq('framing: zero length -> OPENVPN_TCP_FRAME_INVALID', frameErr, 'OPENVPN_TCP_FRAME_INVALID');
 
   console.log(fail ? ('\n' + fail + ' failures') : '\nALL PASS');
   process.exit(fail ? 1 : 0);
