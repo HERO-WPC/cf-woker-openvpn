@@ -2353,7 +2353,10 @@ async function handleWs(req, transport) {
   });
   server.addEventListener('close', closeWs);
   server.addEventListener('error', (e) => { logErr('WS_ERROR', e); closeWs(); });
-  return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
+  // Match the canonical Cloudflare / cfnew 101 exactly: no extra headers. An
+  // empty `Sec-WebSocket-Extensions` value is not a valid RFC6455 extension list
+  // and can leave the upgraded socket without a working message pipe.
+  return new Response(null, { status: 101, webSocket: client });
 }
 
 async function ovpnTest(req, transport) {
@@ -2426,31 +2429,38 @@ async function sockTest(req, transport) {
   }
 }
 
-// WS echo diagnostic: proves whether Cloudflare delivers WebSocket *message* data
-// to our handler at all, independent of VLESS/OpenVPN. Every frame is echoed back.
+// WS diagnostic endpoint (proves both WS directions independently of VLESS):
+//  1. on connect it immediately SENDS a greeting frame  -> tests server->client
+//  2. every client message is echoed back               -> tests client->server
+// A real VLESS-shaped frame is also accepted; the greeting is what matters here.
 async function handleDbg(req, transport) {
   const createPair = (transport && transport.createPair) || (() => Object.values(new WebSocketPair()));
   const [client, server] = createPair();
   server.accept();
+  let greetingSent = false;
+  const sendGreeting = () => {
+    if (greetingSent) return;
+    greetingSent = true;
+    try { server.send('DBG_HELLO ' + BUILD); } catch { }
+  };
+  // send right away AND (belt and braces) on the first inbound message, so a lost
+  // pre-listener frame still cannot hide a working outbound pipe.
+  sendGreeting();
   server.addEventListener('message', (e) => {
     try {
+      sendGreeting();
       const d = e.data;
       const bytes = d instanceof ArrayBuffer ? d : (d && d.buffer) || d;
-      try { console.error('[VLESS/OpenVPN] DBG_MSG len=' + (bytes ? bytes.byteLength : 0)); } catch { }
-      server.send(buildSendData(bytes));
-    } catch { }
+      const len = bytes ? bytes.byteLength : 0;
+      try { console.error('[VLESS/OpenVPN] DBG_MSG len=' + len); } catch { }
+      const u = new Uint8Array(bytes);
+      let hex = ''; for (let i = 0; i < u.length && i < 64; i++) hex += u[i].toString(16).padStart(2, '0');
+      server.send('DBG_ECHO:' + len + ':' + hex);
+    } catch (err) { try { server.send('DBG_ERR:' + ((err && err.message) || 'x')); } catch { } }
   });
   server.addEventListener('close', () => { });
   server.addEventListener('error', () => { });
-  return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
-}
-
-function buildSendData(b) {
-  // Return a fresh Uint8Array copy (some runtimes require a standalone buffer).
-  if (b == null) return new Uint8Array(0);
-  const u = new Uint8Array(b.byteLength);
-  u.set(b instanceof Uint8Array ? b : new Uint8Array(b));
-  return u;
+  return new Response(null, { status: 101, webSocket: client });
 }
 
 async function route(req, transport) {

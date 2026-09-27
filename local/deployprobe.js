@@ -1,4 +1,4 @@
-﻿// Probe the DEPLOYED worker over wss://test33333.wang.dpdns.org/ through the
+// Probe the DEPLOYED worker over wss://test33333.wang.dpdns.org/ through the
 // local CONNECT proxy, sending a real VLESS handshake (IPv4 1.1.1.1:80).
 // Mirrors what a v2rayN VLESS+WS client does, so we see the server's response.
 import net from 'node:net';
@@ -8,7 +8,8 @@ import { uuidToBytes } from '../src/vless.js';
 
 const HOST = 'test33333.wang.dpdns.org';
 const PORT = 443;
-const UUID = '00000000-0000-0000-0000-000000000000'; // WRONG UUID on purpose
+const WSPATH = process.argv[2] || '/';       // e.g. /dbg-ws (echo) or / (VLESS)
+const UUID = process.argv[3] || '2523c510-9ff0-415b-9582-93949bfae7e3';
 const PROXY = { host: '127.0.0.1', port: 10808 };
 const id = uuidToBytes(UUID);
 
@@ -65,7 +66,7 @@ function startTls() {
     console.log('TLS secured, protocol=' + tlsSocket.getProtocol());
     if (excess.length) tlsSocket.write(excess);
     const key = crypto.randomBytes(16).toString('base64');
-    tlsSocket.write('GET / HTTP/1.1\r\nHost: ' + HOST + '\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ' + key + '\r\nSec-WebSocket-Version: 13\r\n\r\n');
+    tlsSocket.write('GET ' + WSPATH + ' HTTP/1.1\r\nHost: ' + HOST + '\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ' + key + '\r\nSec-WebSocket-Version: 13\r\n\r\n');
   });
   let buf = Buffer.alloc(0), handshook = false;
   tlsSocket.on('data', (d) => {
@@ -95,7 +96,9 @@ function startTls() {
       console.log('WS frame op=' + op + ' len=' + len + ' text=' + (op === 1 ? p.toString() : p.toString('hex').slice(0, 60)));
       if (op === 1 || op === 2) {
         const t = p.toString(op === 1 ? 'utf8' : 'latin1');
-        if (/HTTP\/1\.[01]/.test(t) || t.includes('301') || t.length > 20) { console.log('=== VLESS WORKED on DEPLOYED worker ==='); console.log(t.slice(0, 300)); process.exit(0); }
+        if (WSPATH !== '/' && t.startsWith('DBG_HELLO')) { console.log('=== OUTBOUND WS PIPE OK (got greeting) ==='); process.exit(0); }
+        if (WSPATH !== '/' && t.startsWith('DBG_ECHO:')) { console.log('=== INBOUND+OUTBOUND WS OK (echo) ==='); process.exit(0); }
+        if (/HTTP\/1\.[01]/.test(t) || t.includes('301')) { console.log('=== VLESS WORKED on DEPLOYED worker ==='); console.log(t.slice(0, 300)); process.exit(0); }
       }
     }
   });
