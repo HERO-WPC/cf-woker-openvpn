@@ -2230,7 +2230,7 @@ async function handleWs(req, transport) {
   const process = async (chunk) => {
     if (w) return w.write(chunk);
     const v = vless(chunk, idBytes);
-    if (!v) return close();
+    if (!v) { try { server.send('VLESS_REJECT'); } catch { } return close(); }
     send(new Uint8Array([chunk[0], 0]));
     if (!_cfg) return close();
     const host = addr(v.addrType, v.addrBytes), payload = chunk.subarray(v.dataOffset);
