@@ -21,8 +21,9 @@ function collectExports(src) {
   src = src.replace(/^[ \t]*export\s+(const|let|var)\s+([A-Za-z_$][\w$]*)/gm, (m, kw, name) => { names.push(name); return `${kw} ${name}`; });
   // export function / async function / class NAME
   src = src.replace(/^[ \t]*export\s+(async\s+function|function|class)\s+([A-Za-z_$][\w$]*)/gm, (m, kw, name) => { names.push(name); return `${kw} ${name}`; });
-  // export default EXPR;
-  src = src.replace(/^[ \t]*export\s+default\s+/gm, () => { hasDefault = true; return '__default = '; });
+  // export default EXPR;  -> const __default = EXPR;  (must DECLARE it: the
+  // bundle is an ESM module, so assigning an undeclared name throws in strict mode)
+  src = src.replace(/^[ \t]*export\s+default\s+/gm, () => { hasDefault = true; return 'const __default = '; });
   // export { a, b };  (re-export of local/imported names)
   src = src.replace(/^[ \t]*export\s*\{([^}]*)\}\s*;/gm, (m, inner) => {
     inner.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => {
