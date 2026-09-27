@@ -2426,11 +2426,41 @@ async function sockTest(req, transport) {
   }
 }
 
+// WS echo diagnostic: proves whether Cloudflare delivers WebSocket *message* data
+// to our handler at all, independent of VLESS/OpenVPN. Every frame is echoed back.
+async function handleDbg(req, transport) {
+  const createPair = (transport && transport.createPair) || (() => Object.values(new WebSocketPair()));
+  const [client, server] = createPair();
+  server.accept();
+  server.addEventListener('message', (e) => {
+    try {
+      const d = e.data;
+      const bytes = d instanceof ArrayBuffer ? d : (d && d.buffer) || d;
+      try { console.error('[VLESS/OpenVPN] DBG_MSG len=' + (bytes ? bytes.byteLength : 0)); } catch { }
+      server.send(buildSendData(bytes));
+    } catch { }
+  });
+  server.addEventListener('close', () => { });
+  server.addEventListener('error', () => { });
+  return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
+}
+
+function buildSendData(b) {
+  // Return a fresh Uint8Array copy (some runtimes require a standalone buffer).
+  if (b == null) return new Uint8Array(0);
+  const u = new Uint8Array(b.byteLength);
+  u.set(b instanceof Uint8Array ? b : new Uint8Array(b));
+  return u;
+}
+
 async function route(req, transport) {
   const url = new URL(req.url);
   // WS upgrades take priority: a VLESS client may use ANY path (but never keep
   // /ovpn-test|/sock-test|/version as plain HTTP workers from a client's path).
-  if (req.headers.get('Upgrade') === 'websocket') return handleWs(req, transport);
+  if (req.headers.get('Upgrade') === 'websocket') {
+    if (url.pathname === '/dbg-ws') return handleDbg(req, transport);
+    return handleWs(req, transport);
+  }
   if (url.pathname === '/ovpn-test') return ovpnTest(req, transport);
   if (url.pathname === '/sock-test') return sockTest(req, transport);
   if (url.pathname === '/version') return json({ name: 'cf-worker-openvpn', version: BUILD, uuid: UUID, routes: ['/ovpn-test', '/sock-test', '/version'] });
