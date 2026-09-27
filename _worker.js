@@ -2015,16 +2015,23 @@ async function ovpnTest(req, transport) {
   let cfg;
   try { cfg = parseOvpn(cfgText); } catch (e) { return json({ ok: false, stage: 'config', error: String(e.message || e) }, 400); }
   cfg.username = username; cfg.password = password;
+  // Resolve a domain target to an IPv4 for the user-space dial; keep the domain
+  // as the HTTP Host so IP-echo services (e.g. api.ipify.org) see it correctly.
+  let dstIp = target, host = target;
+  if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(target)) {
+    try { dstIp = await resolveIP(target); } catch { }
+    if (!dstIp) return json({ ok: false, stage: 'resolve', error: 'TARGET_RESOLVE_FAILED ' + target }, 502);
+  }
   let tunnel, tcp;
   try { tunnel = await openVpnConn(cfg, transport); }
   catch (e) { return json({ ok: false, stage: 'openvpn', remotes: cfg.remotes, error: String(e.message || e) }, 502); }
   if (!tunnel.virtualIp) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'openvpn', error: 'NO_VIRTUAL_IP: server connected but did not push an ifconfig', remotes: cfg.remotes }, 502); }
-  try { tcp = await createTcp(tunnel, tunnel.virtualIp, target, port); }
+  try { tcp = await createTcp(tunnel, tunnel.virtualIp, dstIp, port); }
   catch (e) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'tcp', error: String(e.message || e) }, 502); }
   const wr = tcp.writable.getWriter(), rd = tcp.readable.getReader();
   let text = '';
   try {
-    await wr.write(enc(`GET ${path} HTTP/1.0\r\nHost: ${target}\r\nUser-Agent: cf-worker-openvpn\r\nConnection: close\r\n\r\n`));
+    await wr.write(enc(`GET ${path} HTTP/1.0\r\nHost: ${host}\r\nUser-Agent: cf-worker-openvpn\r\nConnection: close\r\n\r\n`));
     for (let i = 0; i < 200; i++) {
       const { value, done } = await Promise.race([rd.read(), timeoutSec(6000)]);
       if (done) break;
@@ -2032,7 +2039,7 @@ async function ovpnTest(req, transport) {
     }
   } catch { }
   try { tcp.close(); } catch { }
-  return json({ ok: true, virtualIp: tunnel.virtualIp, response: text.slice(0, 8000) });
+  return json({ ok: true, virtualIp: tunnel.virtualIp, target: host, targetIp: dstIp, response: text.slice(0, 8000) });
 }
 
 // Diagnostic: raw cloudflare:sockets connect() test against any target. Use to
