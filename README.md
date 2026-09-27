@@ -78,7 +78,10 @@ node build.js        # 产出单文件 _worker.js（无依赖）
 node --check _worker.js
 ```
 
-将 `_worker.js` 部署到 Cloudflare Workers 即可。在 Worker 环境变量或绑定中提供 `OPENVPN_OVPN`（`.ovpn` 全文），或用 `_setOpenVpnConfig()` 运行时设置。
+将 `_worker.js` 部署到 Cloudflare Workers 即可(只需粘贴这一个文件)。
+
+> **已内置节点**:已内嵌一个 VPN Gate OpenVPN TCP 节点(`src/embedded-ovpn.js`,主节点 `219.100.37.224:443` + 备用节点,自动切换),所以**开箱即用**。
+> 想换节点,用 Worker 环境变量/`_setOpenVpnConfig()`/`.ovpn` 覆盖即可。
 
 ## 测试
 

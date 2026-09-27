@@ -6,11 +6,13 @@ import { openVpnConn } from './openvpn/client.js';
 import { createTcp } from './tcp.js';
 import { parseOvpn } from './openvpn/config.js';
 import { concat } from './openvpn/bytes.js';
+import { EMBEDDED_OVPN } from './embedded-ovpn.js';
 
 // ---- config ----
-// `OPENVPN_OVPN` is the .ovpn config used for VLESS mode. Replace it with your
-// own config (e.g. a VPN Gate node) before deploying, or override at runtime.
-let OPENVPN_OVPN = '';
+// A VPN Gate OpenVPN TCP node is embedded (see src/embedded-ovpn.js), so the
+// worker works out of the box. Override at runtime with _setOpenVpnConfig()
+// or by editing OPTIONS/binding OPENVPN_OVPN in the dashboard.
+let OPENVPN_OVPN = EMBEDDED_OVPN || '';
 let _cfg = null, _cfgErr = null;
 
 function refreshConfig() {
