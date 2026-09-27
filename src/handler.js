@@ -62,11 +62,19 @@ async function handleWs(req, transport) {
     payload.byteLength && await w.write(payload);
     relay(sock.readable.getReader(), send, () => { try { sock.close(); } catch { } close(); });
   };
-  if (ed?.length <= MAX_ED) chain = chain.then(() => process(Uint8Array.fromBase64(ed, { alphabet: 'base64url' }))).catch(close);
+  // early-data (sec-websocket-protocol) is OPTIONAL. Some clients send a
+  // subprotocol name here (e.g. "vless") instead of base64 early data; decode
+  // defensively and never let it break the normal message path.
+  if (ed && ed.length <= MAX_ED) {
+    try {
+      const early = Uint8Array.fromBase64(ed, { alphabet: 'base64url' });
+      if (early.length) chain = chain.then(() => process(early)).catch(close);
+    } catch { /* not base64 early-data / a subprotocol: fall through to message events */ }
+  }
   server.addEventListener('message', (e) => { chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(close); });
   server.addEventListener('close', close);
   server.addEventListener('error', close);
-  return new Response(null, { status: 101, webSocket: client, headers: ed ? { 'sec-websocket-protocol': ed } : {} });
+  return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
 }
 
 async function ovpnTest(req, transport) {
