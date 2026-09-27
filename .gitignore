@@ -1,0 +1,17 @@
+# Local reference / debug material — not part of the deliverable
+_ref/
+CF-Workers-SoftEther/
+
+# node
+node_modules/
+
+# generated / debug artifacts
+*.log
+*.bin
+test/cap_keys.json
+test/tlsdump.log
+test/km2.bin
+
+# OS
+.DS_Store
+Thumbs.db

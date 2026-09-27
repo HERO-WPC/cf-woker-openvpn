@@ -1,0 +1,10 @@
+{
+  "name": "cf-workers-openvpn-tcp",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node test/run.js",
+    "build": "node build.js"
+  }
+}

@@ -1,0 +1,117 @@
+// Worker request routing: VLESS-over-WebSocket tunnel entry (unchanged from the
+// original project) + an /ovpn-test diagnostic endpoint. Pure Workers JS.
+import { vless, addr } from './vless.js';
+import { resolveIP } from './dns.js';
+import { openVpnConn } from './openvpn/client.js';
+import { createTcp } from './tcp.js';
+import { parseOvpn } from './openvpn/config.js';
+import { concat } from './openvpn/bytes.js';
+
+// ---- config ----
+// `OPENVPN_OVPN` is the .ovpn config used for VLESS mode. Replace it with your
+// own config (e.g. a VPN Gate node) before deploying, or override at runtime.
+let OPENVPN_OVPN = '';
+let _cfg = null, _cfgErr = null;
+
+function refreshConfig() {
+  try { _cfg = OPENVPN_OVPN ? parseOvpn(OPENVPN_OVPN) : null; _cfgErr = null; }
+  catch (e) { _cfg = null; _cfgErr = String(e.message || e); }
+}
+refreshConfig();
+export function _setOpenVpnConfig(text) { OPENVPN_OVPN = text || ''; refreshConfig(); }
+
+const UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
+const idBytes = Uint8Array.from(UUID.replaceAll('-', ''), (c) => parseInt(c, 16));
+const enc = (s) => new TextEncoder().encode(s);
+const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
+const timeoutSec = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));
+const MAX_ED = 8192;
+
+const relay = async (rd, send, close) => {
+  try { for (;;) { const { done, value } = await rd.read(); if (done) break; value?.byteLength && send(value); } }
+  catch { }
+  finally { try { rd.releaseLock(); } catch { } close(); }
+};
+
+async function handleWs(req, transport) {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  const ed = req.headers.get('sec-websocket-protocol');
+  let w = null, sock = null, chain = Promise.resolve();
+  const close = () => { try { sock?.close(); } catch { } try { server.close(); } catch { } };
+  const send = (d) => { try { server.send(d); } catch { } };
+  const process = async (chunk) => {
+    if (w) return w.write(chunk);
+    const v = vless(chunk, idBytes);
+    if (!v) return close();
+    send(new Uint8Array([chunk[0], 0]));
+    if (!_cfg) return close();
+    const host = addr(v.addrType, v.addrBytes), payload = chunk.subarray(v.dataOffset);
+    let targetIp;
+    try { targetIp = v.addrType === 1 ? host : await resolveIP(host); } catch { }
+    if (!targetIp) return close();
+    let tunnel, tcp;
+    try {
+      tunnel = await openVpnConn(_cfg, transport); // each VLESS connection gets its own OpenVPN socket
+      tcp = await createTcp(tunnel, tunnel.virtualIp, targetIp, v.port);
+    } catch { return close(); }
+    sock = tcp;
+    w = sock.writable.getWriter();
+    payload.byteLength && await w.write(payload);
+    relay(sock.readable.getReader(), send, () => { try { sock.close(); } catch { } close(); });
+  };
+  if (ed?.length <= MAX_ED) chain = chain.then(() => process(Uint8Array.fromBase64(ed, { alphabet: 'base64url' }))).catch(close);
+  server.addEventListener('message', (e) => { chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(close); });
+  server.addEventListener('close', close);
+  server.addEventListener('error', close);
+  return new Response(null, { status: 101, webSocket: client, headers: ed ? { 'sec-websocket-protocol': ed } : {} });
+}
+
+async function ovpnTest(req, transport) {
+  const url = new URL(req.url);
+  const p = url.searchParams;
+  let cfgText = '', username = p.get('username') || 'vpn', password = p.get('password') || 'vpn';
+  const target = p.get('target') || '1.1.1.1';
+  const port = +(p.get('port') || 80);
+  const path = p.get('path') || '/cdn-cgi/trace';
+  if (req.method === 'POST') {
+    const ct = req.headers.get('content-type') || '';
+    if (ct.includes('application/json')) { const j = await req.json(); cfgText = j.config || j.ovpn || ''; username = j.username || username; password = j.password || password; }
+    else if (ct.includes('multipart/form-data')) {
+      const form = await req.formData();
+      const f = form.get('config') || form.get('file') || form.get('ovpn');
+      cfgText = typeof f === 'string' ? f : (f ? await f.text() : '');
+      username = form.get('username') || username; password = form.get('password') || password;
+    } else cfgText = await req.text();
+  } else cfgText = p.get('config') || p.get('ovpn') || OPENVPN_OVPN;
+  if (!cfgText) return json({ ok: false, error: 'OPENVPN_CONFIG_MISSING' }, 400);
+  let cfg;
+  try { cfg = parseOvpn(cfgText); } catch (e) { return json({ ok: false, stage: 'config', error: String(e.message || e) }, 400); }
+  cfg.username = username; cfg.password = password;
+  let tunnel, tcp;
+  try { tunnel = await openVpnConn(cfg, transport); }
+  catch (e) { return json({ ok: false, stage: 'openvpn', error: String(e.message || e) }, 502); }
+  try { tcp = await createTcp(tunnel, tunnel.virtualIp, target, port); }
+  catch (e) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'tcp', error: String(e.message || e) }, 502); }
+  const wr = tcp.writable.getWriter(), rd = tcp.readable.getReader();
+  let text = '';
+  try {
+    await wr.write(enc(`GET ${path} HTTP/1.0\r\nHost: ${target}\r\nUser-Agent: cf-worker-openvpn\r\nConnection: close\r\n\r\n`));
+    for (let i = 0; i < 200; i++) {
+      const { value, done } = await Promise.race([rd.read(), timeoutSec(6000)]);
+      if (done) break;
+      if (value) { text += new TextDecoder().decode(value); if (text.length > 8000) break; }
+    }
+  } catch { }
+  try { tcp.close(); } catch { }
+  return json({ ok: true, virtualIp: tunnel.virtualIp, response: text.slice(0, 8000) });
+}
+
+export async function route(req, transport) {
+  const url = new URL(req.url);
+  if (url.pathname === '/ovpn-test') return ovpnTest(req, transport);
+  if (req.headers.get('Upgrade') === 'websocket') return handleWs(req, transport);
+  return new Response('ok');
+}
+
+export { _cfg, _cfgErr };
