@@ -18,3 +18,6 @@ Thumbs.db
 
 # bundler test shim
 _worker.local.mjs
+
+# throwaway probe
+test/_probe-ip.js
