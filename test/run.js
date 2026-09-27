@@ -6,6 +6,7 @@ import { root } from './root.js';
 const T = root();
 const steps = [
   { name: 'unit', cmd: ['node', 'test/unit.js'] },
+  { name: 'vless flow', cmd: ['node', 'test/vless-flow-test.js'] },
   { name: 'tcp stack', cmd: ['node', 'test/tcp-test.js'] },
   { name: 'tls trust/EKU', cmd: ['node', 'test/tls-test.js'] },
   { name: 'mock GCM', cmd: ['node', 'test/mocktest.js', 'AES-128-GCM'] },

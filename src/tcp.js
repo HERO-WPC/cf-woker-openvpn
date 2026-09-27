@@ -16,6 +16,8 @@ const MAX_RETRIES = 5;
 const RTO_INIT = 1000;             // ms, initial retransmission timeout
 const RTO_MAX = 32000;
 const WINDOW = 65535;
+// Debug flag — must not touch Node-only globals on Cloudflare Workers.
+const TCPDBG = (typeof process !== 'undefined' && process && process.env && process.env.TCPDBG) ? true : false;
 
 function ipB(ip) {
   if (typeof ip !== 'string' || !/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) { const e = new Error('INVALID_IP ' + String(ip)); e.code = 'INVALID_IP'; throw e; }
@@ -92,7 +94,8 @@ export class TcpFlow {
     this.state = 'CLOSED';
     this.rto = RTO_INIT;
     this.reader = null;
-    this.timer = null;
+    this.retransTimer = null;   // setInterval handle (a NUMBER in Cloudflare Workers)
+    this.handshakeTimer = null; // setTimeout handle (a NUMBER in CF Workers)
     this.ctrl = null;             // readable controller
     this.appClosed = false;
     this.deliver = () => {};      // app data callback
@@ -182,7 +185,7 @@ export class TcpFlow {
 
   _receive(seg) {
     const segEnd = seg.endSeq;
-    if (process.env.TCPDBG) console.log('[recv] seq=' + seg.seq + ' end=' + segEnd + ' rcvNxt=' + this.rcvNxt + ' len=' + seg.payload.length + ' dup=' + seqLe(segEnd, this.rcvNxt));
+    if (TCPDBG) console.log('[recv] seq=' + seg.seq + ' end=' + segEnd + ' rcvNxt=' + this.rcvNxt + ' len=' + seg.payload.length + ' dup=' + seqLe(segEnd, this.rcvNxt));
     // fully duplicate (already fully delivered)
     if (seqLe(segEnd, this.rcvNxt)) return;
     // exactly contiguous at rcvNxt
@@ -199,7 +202,7 @@ export class TcpFlow {
     }
     // ahead of rcvNxt -> buffer
     if (seqLt(this.rcvNxt, seg.seq)) {
-      if (process.env.TCPDBG) console.log('[recv] buffering seq=' + seg.seq + ' (lt=' + seqLt(this.rcvNxt, seg.seq) + ')');
+      if (TCPDBG) console.log('[recv] buffering seq=' + seg.seq + ' (lt=' + seqLt(this.rcvNxt, seg.seq) + ')');
       this.outOfOrder.push(seg);
       this.outOfOrder.sort((a, b) => a.seq - b.seq);
     }
@@ -210,7 +213,7 @@ export class TcpFlow {
       if (i < 0) break;
       const seg = this.outOfOrder[i];
       this.outOfOrder.splice(i, 1);
-      if (process.env.TCPDBG) console.log('[drain] delivering buffered seq=' + seg.seq + ' len=' + seg.payload.length);
+      if (TCPDBG) console.log('[drain] delivering buffered seq=' + seg.seq + ' len=' + seg.payload.length);
       this._deliver(seg, 0);
     }
   }
@@ -270,7 +273,8 @@ export class TcpFlow {
   _shutdown(reset) {
     if (this._closed) return;
     this._closed = true;
-    try { clearInterval(this.timer); } catch { }
+    try { if (this.retransTimer !== null) clearInterval(this.retransTimer); } catch { }
+    try { if (this.handshakeTimer !== null) clearTimeout(this.handshakeTimer); } catch { }
     try { this.reader && this.reader.cancel(); } catch { }
     try { this.tunnel.close && this.tunnel.close(); } catch { }
     this.ctrl && (this.ctrl.close(), (this.ctrl = null));
@@ -305,14 +309,15 @@ export async function createTcp(tunnel, srcIp, dstIp, dstPort) {
   flow._emit(FLAG_SYN, new Uint8Array(0), flow.iss, 0);
   flow._track(flow.iss, (flow.iss + 1) >>> 0, new Uint8Array(0), FLAG_SYN);
   flow.sndNxt = (flow.iss + 1) >>> 0;
-  // --- retransmission timer ---
-  const timer = setInterval(() => flow.tick(), 250);
-  flow.timer = timer;
-  const handshake = await Promise.race([
-    ready,
-    new Promise((_, rej) => { flow.timer.handshakeLimit = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; rej(e); }, 15000); }),
-  ]).catch((e) => { flow._shutdown(true); throw e; });
-  clearTimeout(flow.timer.handshakeLimit);
+  // --- timers: separate handles (CF setInterval/setTimeout return plain numbers,
+  //     so never attach properties to the handle) ---
+  flow.retransTimer = setInterval(() => flow.tick(), 250);
+  let handshakeReject;
+  const handshakeTimeout = new Promise((_, rej) => { handshakeReject = rej; });
+  flow.handshakeTimer = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; try { handshakeReject && handshakeReject(e); } catch { } }, 15000);
+  await Promise.race([ready, handshakeTimeout]).catch((e) => { flow._shutdown(true); throw e; });
+  clearTimeout(flow.handshakeTimer);
+  flow.handshakeTimer = null;
 
   // --- application writable stream ---
   const writable = new WritableStream({

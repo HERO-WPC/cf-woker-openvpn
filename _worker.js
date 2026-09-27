@@ -132,12 +132,45 @@ function vless(c, uuidBytes) {
   };
 }
 
+// Parse a VLESS request header from a byte buffer that may arrive across
+// multiple WebSocket messages. Returns:
+//   null   -> need more bytes (keep buffering; never treat a partial message as
+//             an error)
+//   { error: CODE, message } -> invalid (UUID / command / address)
+//   { version, port, addrType, host, headerLen } -> ready
+// Address types are standard VLESS: 1=IPv4, 2=domain, 3=IPv6.
+function parseVlessHeader(buf, uuidBytes) {
+  if (buf.length < 22) return null; // ver+uuid+opt+cmd+port+type
+  const optLen = buf[17];
+  const cmdIndex = 18 + optLen;
+  if (buf.length < cmdIndex + 4) return null;
+  const cmd = buf[cmdIndex];
+  const port = (buf[cmdIndex + 1] << 8) | buf[cmdIndex + 2];
+  const addrType = buf[cmdIndex + 3];
+  let addrLen;
+  if (addrType === 1) addrLen = 4;
+  else if (addrType === 2) { if (buf.length < cmdIndex + 5) return null; addrLen = buf[cmdIndex + 4]; }
+  else if (addrType === 3) addrLen = 16;
+  else return { error: 'VLESS_ADDRESS_INVALID', message: 'address type ' + addrType + ' is not supported' };
+  const addrStart = addrType === 2 ? cmdIndex + 5 : cmdIndex + 4;
+  const headerLen = addrStart + addrLen;
+  if (buf.length < headerLen) return null; // still a partial header
+  if (cmd !== 1) return { error: 'VLESS_COMMAND_UNSUPPORTED', message: 'command ' + cmd + ' (only tcp=1, udp=2 unsupported)' };
+  for (let i = 0; i < 16; i++) if (buf[1 + i] !== uuidBytes[i]) return { error: 'VLESS_UUID_INVALID', message: 'uuid mismatch' };
+  let host;
+  if (addrType === 1) host = `${buf[addrStart]}.${buf[addrStart + 1]}.${buf[addrStart + 2]}.${buf[addrStart + 3]}`;
+  else if (addrType === 2) host = new TextDecoder().decode(buf.subarray(addrStart, addrStart + addrLen));
+  else { const g = []; for (let i = 0; i < 8; i++) g.push(((buf[addrStart + i * 2] << 8) | buf[addrStart + i * 2 + 1]).toString(16)); host = g.join(':'); }
+  if (!host) return { error: 'VLESS_ADDRESS_INVALID', message: 'empty address' };
+  return { version: buf[0], port, addrType, host, headerLen };
+}
+
 const addr = (t, b) => t === 3
   ? new TextDecoder().decode(b)
   : t === 1
     ? `${b[0]}.${b[1]}.${b[2]}.${b[3]}`
     : `[${Array.from({ length: 8 }, (_, i) => u16(b, i * 2).toString(16)).join(':')}]`;
-return { addr, uuidToBytes, vless };
+return { addr, uuidToBytes, vless, parseVlessHeader };
 })();
 __ns["m2"] = m2;
 const m4 = (() => {
@@ -1856,6 +1889,8 @@ const MAX_RETRIES = 5;
 const RTO_INIT = 1000;             // ms, initial retransmission timeout
 const RTO_MAX = 32000;
 const WINDOW = 65535;
+// Debug flag — must not touch Node-only globals on Cloudflare Workers.
+const TCPDBG = (typeof process !== 'undefined' && process && process.env && process.env.TCPDBG) ? true : false;
 
 function ipB(ip) {
   if (typeof ip !== 'string' || !/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) { const e = new Error('INVALID_IP ' + String(ip)); e.code = 'INVALID_IP'; throw e; }
@@ -1932,7 +1967,8 @@ class TcpFlow {
     this.state = 'CLOSED';
     this.rto = RTO_INIT;
     this.reader = null;
-    this.timer = null;
+    this.retransTimer = null;   // setInterval handle (a NUMBER in Cloudflare Workers)
+    this.handshakeTimer = null; // setTimeout handle (a NUMBER in CF Workers)
     this.ctrl = null;             // readable controller
     this.appClosed = false;
     this.deliver = () => {};      // app data callback
@@ -2022,7 +2058,7 @@ class TcpFlow {
 
   _receive(seg) {
     const segEnd = seg.endSeq;
-    if (process.env.TCPDBG) console.log('[recv] seq=' + seg.seq + ' end=' + segEnd + ' rcvNxt=' + this.rcvNxt + ' len=' + seg.payload.length + ' dup=' + seqLe(segEnd, this.rcvNxt));
+    if (TCPDBG) console.log('[recv] seq=' + seg.seq + ' end=' + segEnd + ' rcvNxt=' + this.rcvNxt + ' len=' + seg.payload.length + ' dup=' + seqLe(segEnd, this.rcvNxt));
     // fully duplicate (already fully delivered)
     if (seqLe(segEnd, this.rcvNxt)) return;
     // exactly contiguous at rcvNxt
@@ -2039,7 +2075,7 @@ class TcpFlow {
     }
     // ahead of rcvNxt -> buffer
     if (seqLt(this.rcvNxt, seg.seq)) {
-      if (process.env.TCPDBG) console.log('[recv] buffering seq=' + seg.seq + ' (lt=' + seqLt(this.rcvNxt, seg.seq) + ')');
+      if (TCPDBG) console.log('[recv] buffering seq=' + seg.seq + ' (lt=' + seqLt(this.rcvNxt, seg.seq) + ')');
       this.outOfOrder.push(seg);
       this.outOfOrder.sort((a, b) => a.seq - b.seq);
     }
@@ -2050,7 +2086,7 @@ class TcpFlow {
       if (i < 0) break;
       const seg = this.outOfOrder[i];
       this.outOfOrder.splice(i, 1);
-      if (process.env.TCPDBG) console.log('[drain] delivering buffered seq=' + seg.seq + ' len=' + seg.payload.length);
+      if (TCPDBG) console.log('[drain] delivering buffered seq=' + seg.seq + ' len=' + seg.payload.length);
       this._deliver(seg, 0);
     }
   }
@@ -2110,7 +2146,8 @@ class TcpFlow {
   _shutdown(reset) {
     if (this._closed) return;
     this._closed = true;
-    try { clearInterval(this.timer); } catch { }
+    try { if (this.retransTimer !== null) clearInterval(this.retransTimer); } catch { }
+    try { if (this.handshakeTimer !== null) clearTimeout(this.handshakeTimer); } catch { }
     try { this.reader && this.reader.cancel(); } catch { }
     try { this.tunnel.close && this.tunnel.close(); } catch { }
     this.ctrl && (this.ctrl.close(), (this.ctrl = null));
@@ -2145,14 +2182,15 @@ async function createTcp(tunnel, srcIp, dstIp, dstPort) {
   flow._emit(FLAG_SYN, new Uint8Array(0), flow.iss, 0);
   flow._track(flow.iss, (flow.iss + 1) >>> 0, new Uint8Array(0), FLAG_SYN);
   flow.sndNxt = (flow.iss + 1) >>> 0;
-  // --- retransmission timer ---
-  const timer = setInterval(() => flow.tick(), 250);
-  flow.timer = timer;
-  const handshake = await Promise.race([
-    ready,
-    new Promise((_, rej) => { flow.timer.handshakeLimit = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; rej(e); }, 15000); }),
-  ]).catch((e) => { flow._shutdown(true); throw e; });
-  clearTimeout(flow.timer.handshakeLimit);
+  // --- timers: separate handles (CF setInterval/setTimeout return plain numbers,
+  //     so never attach properties to the handle) ---
+  flow.retransTimer = setInterval(() => flow.tick(), 250);
+  let handshakeReject;
+  const handshakeTimeout = new Promise((_, rej) => { handshakeReject = rej; });
+  flow.handshakeTimer = setTimeout(() => { const e = new Error('TCP_HANDSHAKE_TIMEOUT'); e.code = 'TCP_HANDSHAKE_TIMEOUT'; try { handshakeReject && handshakeReject(e); } catch { } }, 15000);
+  await Promise.race([ready, handshakeTimeout]).catch((e) => { flow._shutdown(true); throw e; });
+  clearTimeout(flow.handshakeTimer);
+  flow.handshakeTimer = null;
 
   // --- application writable stream ---
   const writable = new WritableStream({
@@ -2177,12 +2215,12 @@ return { EMBEDDED_OVPN };
 __ns["m14"] = m14;
 const m1 = (() => {
 const { EMBEDDED_OVPN } = __ns["m14"];
-const { concat } = __ns["m3"];
+const { concat, bytes } = __ns["m3"];
 const { parseOvpn } = __ns["m12"];
 const { createTcp } = __ns["m13"];
 const { openVpnConn } = __ns["m5"];
 const { resolveIP } = __ns["m4"];
-const { vless, addr, uuidToBytes } = __ns["m2"];
+const { parseVlessHeader, uuidToBytes } = __ns["m2"];
 // Worker request routing: VLESS-over-WebSocket tunnel entry (unchanged from the
 // original project) + an /ovpn-test diagnostic endpoint. Pure Workers JS.
 
@@ -2221,44 +2259,95 @@ const relay = async (rd, send, close) => {
 };
 
 async function handleWs(req, transport) {
-  const [client, server] = Object.values(new WebSocketPair());
+  const createPair = (transport && transport.createPair) || (() => Object.values(new WebSocketPair()));
+  const [client, server] = createPair();
   server.accept();
   const ed = req.headers.get('sec-websocket-protocol');
-  let w = null, sock = null, chain = Promise.resolve();
-  const close = () => { try { sock?.close(); } catch { } try { server.close(); } catch { } };
+
+  // VLESS front-end state machine (aligned with cfnew's data flow).
+  let hdrBuf = new Uint8Array(0);
+  let hdr = null;
+  let tcp = null, tcpW = null, tcpR = null;
+  let buffered = [];                 // bytes arriving while the backend connects
+  let headSent = false;              // response header [version,0] sent once
+  let state = 'READING_VLESS_HEADER'; // READING_VLESS_HEADER | CONNECTING | RELAY | CLOSED
+  let chain = Promise.resolve();
+
+  const vlessErr = (code, message) => { const e = new Error(message); e.code = code; return e; };
+  const logErr = (stage, err) => { try { console.error('[VLESS/OpenVPN] ' + stage, (err && err.code) || '', (err && err.message) || String(err)); } catch { } };
+  const closeWs = () => { try { tcp && tcp.close && tcp.close(); } catch { } try { server.close(); } catch { } state = 'CLOSED'; };
   const send = (d) => { try { server.send(d); } catch { } };
-  const process = async (chunk) => {
-    if (w) return w.write(chunk);
-    const v = vless(chunk, idBytes);
-    if (!v) { try { server.send('VLESS_REJECT'); } catch { } return close(); }
-    send(new Uint8Array([chunk[0], 0]));
-    if (!_cfg) return close();
-    const host = addr(v.addrType, v.addrBytes), payload = chunk.subarray(v.dataOffset);
-    let targetIp;
-    try { targetIp = v.addrType === 1 ? host : await resolveIP(host); } catch { }
-    if (!targetIp) return close();
-    let tunnel, tcp;
+
+  // remote (user-space TCP) -> client: prepend [version,0] exactly once
+  const relayRemote = async (rd) => {
     try {
-      tunnel = await openVpnConn(_cfg, transport); // each VLESS connection gets its own OpenVPN socket
-      tcp = await createTcp(tunnel, tunnel.virtualIp, targetIp, v.port);
-    } catch { return close(); }
-    sock = tcp;
-    w = sock.writable.getWriter();
-    payload.byteLength && await w.write(payload);
-    relay(sock.readable.getReader(), send, () => { try { sock.close(); } catch { } close(); });
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        if (!value || !value.byteLength) continue;
+        if (!headSent) { send(concat(bytes([hdr.version]), bytes([0]), value)); headSent = true; }
+        else send(value);
+      }
+      if (!headSent) { send(bytes([hdr.version, 0])); headSent = true; } // ensure header even with no remote data
+      closeWs();
+    } catch (err) { logErr('VLESS_RELAY_READ', err); closeWs(); }
   };
-  // early-data (sec-websocket-protocol) is OPTIONAL. Some clients send a
-  // subprotocol name here (e.g. "vless") instead of base64 early data; decode
-  // defensively and never let it break the normal message path.
+
+  // Backend connect (OpenVPN + user-space TCP) + flush initial payload.
+  const connectBackend = async (port, initialPayload) => {
+    state = 'CONNECTING';
+    try {
+      let targetIp;
+      try { targetIp = hdr.addrType === 1 ? hdr.host : await resolveIP(hdr.host); } catch { }
+      if (!targetIp) throw vlessErr('VLESS_ADDRESS_INVALID', 'target resolve failed: ' + hdr.host);
+      if (!_cfg) throw vlessErr('OPENVPN_CONFIG_MISSING', 'no VPN config loaded');
+      const tunnel = await openVpnConn(_cfg, transport);
+      if (!tunnel.virtualIp) throw vlessErr('OPENVPN_CONNECT_FAILED', 'server connected but no virtual IP');
+      tcp = await createTcp(tunnel, tunnel.virtualIp, targetIp, port);
+    } catch (err) { logErr('OPENVPN_CONNECT_FAILED', err); closeWs(); return; }
+    tcpW = tcp.writable.getWriter();
+    tcpR = tcp.readable.getReader();
+    state = 'RELAY';
+    try {
+      if (initialPayload && initialPayload.length) await tcpW.write(initialPayload);
+      while (buffered.length) await tcpW.write(buffered.shift());
+    } catch (err) { logErr('TCP_WRITE_FAILED', err); closeWs(); return; }
+    relayRemote(tcpR);
+  };
+
+  const pushBytes = async (chunk) => {
+    if (state === 'CLOSED' || !chunk) return;
+    if (state === 'RELAY') { if (tcpW) { try { await tcpW.write(chunk); } catch (err) { logErr('TCP_WRITE_FAILED', err); closeWs(); } } return; }
+    if (state === 'CONNECTING') { buffered.push(chunk); return; }
+    // READING_VLESS_HEADER: accumulate, never assume a WS message == a full header
+    hdrBuf = concat(hdrBuf, chunk);
+    if (!hdr) {
+      const p = parseVlessHeader(hdrBuf, idBytes);
+      if (p === null) return; // wait for more bytes
+      if (p.error) { logErr(p.error, new Error(p.message)); try { server.send('VLESS_REJECT'); } catch { } closeWs(); return; }
+      hdr = p;
+      const rest = hdrBuf.subarray(p.headerLen);
+      hdrBuf = null;
+      await connectBackend(p.port, rest);
+      return;
+    }
+    // header parsed but bytes still arriving while connecting are buffered above
+  };
+
+  // early data (sec-websocket-protocol) feeds the SAME byte stream as messages.
   if (ed && ed.length <= MAX_ED) {
     try {
-      const early = Uint8Array.fromBase64(ed, { alphabet: 'base64url' });
-      if (early.length) chain = chain.then(() => process(early)).catch(close);
-    } catch { /* not base64 early-data / a subprotocol: fall through to message events */ }
+      const bin = atob(String(ed).replace(/-/g, '+').replace(/_/g, '/'));
+      const early = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+      if (early.length) chain = chain.then(() => pushBytes(early)).catch((e) => logErr('VLESS_EARLY_DATA', e));
+    } catch { /* a subprotocol value or bad base64: ignore */ }
   }
-  server.addEventListener('message', (e) => { chain = chain.then(() => process(new Uint8Array(e.data instanceof ArrayBuffer ? e.data : e.data.buffer ?? e.data))).catch(close); });
-  server.addEventListener('close', close);
-  server.addEventListener('error', close);
+  server.addEventListener('message', (e) => {
+    const d = new Uint8Array(e.data instanceof ArrayBuffer ? e.data : (e.data && e.data.buffer) ?? e.data);
+    if (d.length) chain = chain.then(() => pushBytes(d)).catch((err) => logErr('VLESS_MESSAGE', err));
+  });
+  server.addEventListener('close', closeWs);
+  server.addEventListener('error', (e) => { logErr('WS_ERROR', e); closeWs(); });
   return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Extensions': '' } });
 }
 
