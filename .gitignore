@@ -15,3 +15,6 @@ test/km2.bin
 # OS
 .DS_Store
 Thumbs.db
+
+# bundler test shim
+_worker.local.mjs
