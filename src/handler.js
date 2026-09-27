@@ -41,10 +41,12 @@ async function handleWs(req, transport) {
   const [client, server] = createPair();
   server.accept();
   const ed = req.headers.get('sec-websocket-protocol');
+  try { console.error('[VLESS/OpenVPN] WS_UPGRADE from=' + (req.headers.get('cf-connecting-ip') || '?') + ' proto=' + (ed || '-') + ' hdrlen-so-far=0'); } catch { }
 
   // VLESS front-end state machine (aligned with cfnew's data flow).
   let hdrBuf = new Uint8Array(0);
   let hdr = null;
+  let hostname = '';
   let tcp = null, tcpW = null, tcpR = null;
   let buffered = [];                 // bytes arriving while the backend connects
   let headSent = false;              // response header [version,0] sent once
@@ -104,6 +106,8 @@ async function handleWs(req, transport) {
       if (p === null) return; // wait for more bytes
       if (p.error) { logErr(p.error, new Error(p.message)); try { server.send('VLESS_REJECT'); } catch { } closeWs(); return; }
       hdr = p;
+      hostname = p.host;
+      try { console.error('[VLESS/OpenVPN] VLESS_HEADER_OK host=' + p.host + ' port=' + p.port + ' type=' + p.addrType); } catch { }
       const rest = hdrBuf.subarray(p.headerLen);
       hdrBuf = null;
       await connectBackend(p.port, rest);
@@ -201,10 +205,12 @@ async function sockTest(req, transport) {
 
 export async function route(req, transport) {
   const url = new URL(req.url);
+  // WS upgrades take priority: a VLESS client may use ANY path (but never keep
+  // /ovpn-test|/sock-test|/version as plain HTTP workers from a client's path).
+  if (req.headers.get('Upgrade') === 'websocket') return handleWs(req, transport);
   if (url.pathname === '/ovpn-test') return ovpnTest(req, transport);
   if (url.pathname === '/sock-test') return sockTest(req, transport);
   if (url.pathname === '/version') return json({ name: 'cf-worker-openvpn', version: BUILD, uuid: UUID, routes: ['/ovpn-test', '/sock-test', '/version'] });
-  if (req.headers.get('Upgrade') === 'websocket') return handleWs(req, transport);
   return new Response('ok');
 }
 
