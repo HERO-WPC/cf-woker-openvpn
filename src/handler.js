@@ -23,7 +23,7 @@ refreshConfig();
 export function _setOpenVpnConfig(text) { OPENVPN_OVPN = text || ''; refreshConfig(); }
 
 const UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
-const BUILD = 'v2.1-cfnew'; // fixed tag so /version unambiguously reports this front-end
+const BUILD = 'v2.2-wsprobe'; // fixed tag so /version unambiguously reports this front-end
 const idBytes = uuidToBytes(UUID); // strict 16-byte; throws if invalid
 const enc = (s) => new TextEncoder().encode(s);
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
