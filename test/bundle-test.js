@@ -31,8 +31,10 @@ writeFileSync(outPath, shim + local);
 
 try {
   const mod = await import(pathToFileURL(outPath).href + '?t=' + Date.now());
-  // GET /ovpn-test with no config: uses the embedded VPN Gate node.
-  const req = new Request('http://localhost/ovpn-test', { method: 'GET' });
+  // GET /ovpn-test with no config: uses the embedded VPN Gate node. Use an IP
+  // target here so the test doesn't depend on DoH (blocked in this sandbox);
+  // on Cloudflare the domain target would resolve fine.
+  const req = new Request('http://localhost/ovpn-test?target=1.1.1.1&port=80&path=/cdn-cgi/trace', { method: 'GET' });
   const res = await mod.default.fetch(req);
   const j = await res.json();
   console.log('status', res.status);

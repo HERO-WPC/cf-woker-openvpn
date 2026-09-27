@@ -1708,6 +1708,15 @@ async function tryRemote(remote, cfg, transport, log) {
     const cipherName = pushOptions['cipher'] || cfg.cipher || 'AES-256-GCM';
     if (pushOptions['peer-id'] != null) { peerId = parseInt(pushOptions['peer-id'], 10); useV2 = true; }
     virtualIp = parseVirtualIP(pushOptions, pushText);
+    // A node that doesn't push an ifconfig is unusable (i.e. it rejected the
+    // auth or pushed no tunnel address). Treat it as a failed remote so the
+    // caller can fail over to the next node, and surface AUTH_FAILED clearly.
+    if (!virtualIp) {
+      close();
+      const e = new Error(pushText.trim() === 'AUTH_FAILED' ? 'AUTH_FAILED' : 'NO_VIRTUAL_IP: server did not push ifconfig');
+      e.code = 'AUTH_FAILED';
+      throw e;
+    }
 
     // key expansion using client + server key source
     const keyBlock = await keyExpansion({
