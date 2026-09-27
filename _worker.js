@@ -108,11 +108,14 @@ function vless(c, uuidBytes) {
   const p = u16(c, o);
   const t = c[o + 2] === 1 ? 1 : c[o + 2] + 1;
   const l = t === 3 ? c[o + 3] : t === 1 ? 4 : t === 4 ? 16 : 0;
-  if (!l || o + 4 + l > c.length) return null;
+  // Standard VLESS: domain has a 1-byte length right after the type byte;
+  // IPv4/IPv6 do NOT. So the address bytes start at o+3 for IP, o+4 for domain.
+  const addrStart = t === 3 ? o + 4 : o + 3;
+  if (!l || addrStart + l > c.length) return null;
   return {
     addrType: t,
-    addrBytes: c.subarray(o + 4, o + 4 + l),
-    dataOffset: o + 4 + l,
+    addrBytes: c.subarray(addrStart, addrStart + l),
+    dataOffset: addrStart + l,
     port: p,
   };
 }
