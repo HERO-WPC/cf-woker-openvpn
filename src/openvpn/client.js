@@ -70,6 +70,7 @@ function parseKeyMethod2(buf) {
 // ---- state machine ----
 export async function openVpnConn(cfg, transport, opts = {}) {
   const log = opts.log || (() => {});
+  const attempts = [];
   let lastErr;
   for (const remote of cfg.remotes) {
     try {
@@ -77,11 +78,15 @@ export async function openVpnConn(cfg, transport, opts = {}) {
       const tunnel = await tryRemote(remote, cfg, transport, log);
       return tunnel;
     } catch (e) {
-      log('remote ' + remote.host + ' failed: ' + (e.message || e));
+      const msg = String((e && e.message) || e);
+      log('remote ' + remote.host + ' failed: ' + msg);
+      attempts.push(remote.host + ':' + remote.port + ' -> ' + msg);
       lastErr = e;
     }
   }
-  throw lastErr || new Error('OPENVPN_ALL_REMOTES_FAILED');
+  const e = new Error('OPENVPN_ALL_REMOTES_FAILED [' + attempts.join(' | ') + ']');
+  e.code = 'OPENVPN_ALL_REMOTES_FAILED';
+  throw e;
 }
 
 async function tryRemote(remote, cfg, transport, log) {

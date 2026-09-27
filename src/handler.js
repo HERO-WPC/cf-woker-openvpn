@@ -92,7 +92,7 @@ async function ovpnTest(req, transport) {
   cfg.username = username; cfg.password = password;
   let tunnel, tcp;
   try { tunnel = await openVpnConn(cfg, transport); }
-  catch (e) { return json({ ok: false, stage: 'openvpn', error: String(e.message || e) }, 502); }
+  catch (e) { return json({ ok: false, stage: 'openvpn', remotes: cfg.remotes, error: String(e.message || e) }, 502); }
   try { tcp = await createTcp(tunnel, tunnel.virtualIp, target, port); }
   catch (e) { try { tunnel.close(); } catch { } return json({ ok: false, stage: 'tcp', error: String(e.message || e) }, 502); }
   const wr = tcp.writable.getWriter(), rd = tcp.readable.getReader();
@@ -109,9 +109,32 @@ async function ovpnTest(req, transport) {
   return json({ ok: true, virtualIp: tunnel.virtualIp, response: text.slice(0, 8000) });
 }
 
+// Diagnostic: raw cloudflare:sockets connect() test against any target. Use to
+// confirm whether CF allows outbound TCP to a given host/port (e.g. control
+// checks: tcpbin.com:4242, 1.1.1.1:80, a VPN Gate node:443).
+async function sockTest(req, transport) {
+  const p = new URL(req.url).searchParams;
+  const host = p.get('host') || 'tcpbin.com';
+  const port = +(p.get('port') || 4242);
+  let s;
+  try {
+    s = transport.connect({ hostname: host, port });
+    await Promise.race([s.opened, timeoutSec(12000)]);
+    const w = s.writable.getWriter(); const r = s.readable.getReader();
+    await w.write(enc('ping\n'));
+    const { value } = await Promise.race([r.read(), timeoutSec(8000)]);
+    try { s.close(); } catch { }
+    return json({ ok: true, host, port, echo: value ? new TextDecoder().decode(value).slice(0, 200) : null });
+  } catch (e) {
+    try { s && s.close(); } catch { }
+    return json({ ok: false, host, port, error: String(e.message || e) }, 502);
+  }
+}
+
 export async function route(req, transport) {
   const url = new URL(req.url);
   if (url.pathname === '/ovpn-test') return ovpnTest(req, transport);
+  if (url.pathname === '/sock-test') return sockTest(req, transport);
   if (req.headers.get('Upgrade') === 'websocket') return handleWs(req, transport);
   return new Response('ok');
 }
