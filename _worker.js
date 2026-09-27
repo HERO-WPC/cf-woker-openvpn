@@ -2246,6 +2246,7 @@ refreshConfig();
 function _setOpenVpnConfig(text) { OPENVPN_OVPN = text || ''; refreshConfig(); }
 
 const UUID = '2523c510-9ff0-415b-9582-93949bfae7e3';
+const BUILD = '8e77d8e'; // last committed hash; bump on every deploy
 const idBytes = uuidToBytes(UUID); // strict 16-byte; throws if invalid
 const enc = (s) => new TextEncoder().encode(s);
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } });
@@ -2425,6 +2426,7 @@ async function route(req, transport) {
   const url = new URL(req.url);
   if (url.pathname === '/ovpn-test') return ovpnTest(req, transport);
   if (url.pathname === '/sock-test') return sockTest(req, transport);
+  if (url.pathname === '/version') return json({ name: 'cf-worker-openvpn', version: BUILD, uuid: UUID, routes: ['/ovpn-test', '/sock-test', '/version'] });
   if (req.headers.get('Upgrade') === 'websocket') return handleWs(req, transport);
   return new Response('ok');
 }
