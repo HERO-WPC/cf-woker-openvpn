@@ -1998,9 +1998,9 @@ async function ovpnTest(req, transport) {
   const url = new URL(req.url);
   const p = url.searchParams;
   let cfgText = '', username = p.get('username') || 'vpn', password = p.get('password') || 'vpn';
-  const target = p.get('target') || '1.1.1.1';
+  const target = p.get('target') || 'ip-api.com';
   const port = +(p.get('port') || 80);
-  const path = p.get('path') || '/cdn-cgi/trace';
+  const path = p.get('path') || '/json/';
   if (req.method === 'POST') {
     const ct = req.headers.get('content-type') || '';
     if (ct.includes('application/json')) { const j = await req.json(); cfgText = j.config || j.ovpn || ''; username = j.username || username; password = j.password || password; }
